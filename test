@@ -5,28 +5,22 @@ local LocalPlayer = Players.LocalPlayer
 
 local Net = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Net")
 
--- HTTP Обертка для инжектора (Xeno/Synapse/Крнл)
+-- HTTP Обертка для инжектора
 local req = (if type(request) == "function" then request
             elseif type(syn) == "table" and type(syn.request) == "function" then syn.request
             elseif type(http) == "table" and type(http.request) == "function" then http.request
             else nil)
 
 if not req then
-    warn("[❌] Ошибка: ваш инжектор не поддерживает HTTP-запросы. Скрипт остановлен.")
+    warn("[❌] Ошибка: ваш инжектор не поддерживает HTTP-запросы.")
     return
 end
 
 -- ==========================================
--- НАСТРОЙКИ И РЕМОУТЫ
+-- НАСТРОЙКИ И UUID ДЕЙСТВИЙ (Они не меняются!)
 -- ==========================================
 local SERVER_URL = "http://127.0.0.1:8000"
 local POLLING_INTERVAL = 3
-
-local INCOMING_TRADE_RE = Net:WaitForChild("RE/c93b1aeef54945fde91fd99553c926273001301cce5dc16c7e9715850d4fc92b")
-local ACCEPT_TRADE_RF   = Net:WaitForChild("RF/5b533ba6793f3bacaca001d1b27c602e99c2b40daef056c7fffe84aefa07dbe2")
-local ADD_ITEM_RF       = Net:WaitForChild("RF/503612ec4f37779fa4dcde12f7b7c57c56c087658c34d7ad022a063468b1fc55")
-local READY_RE          = Net:WaitForChild("RE/6a7afd736e278bf3a98f40371209fce237eb640deffcbd36b4b83afd2798261d")
-local ACCEPT_FINAL_RE   = Net:WaitForChild("RE/0e936b349a5655c7c671fef058c5833ec2010bb027deeecd21776fc45952d2f7")
 
 local ACCEPT_ACTION_UUID       = "8c94acca-6417-45e5-89f0-efb8b910cde7"
 local ADD_ITEM_ACTION_UUID     = "c85a2323-36b2-4121-968a-c064a6168aff"
@@ -34,6 +28,66 @@ local READY_ACTION_UUID        = "23f15b0b-b633-4f6b-888f-5924b7425522"
 local ACCEPT_FINAL_ACTION_UUID = "86eea964-f19e-4ac6-b401-a71ecc89e596"
 
 local activeOrders = {}
+
+-- ==========================================
+-- УМНОЕ ИСПОЛНЕНИЕ РЕМОУТОВ (Обход античита)
+-- ==========================================
+
+-- 1. Ковровая рассылка для RemoteEvent (Кнопки Ready и Accept)
+local function fireAction(uuid, ...)
+    local args = {...}
+    for _, r in ipairs(Net:GetChildren()) do
+        if r:IsA("RemoteEvent") then
+            -- Отправляем во все. Сервер среагирует только на правильный UUID
+            task.spawn(function() pcall(function() r:FireServer(uuid, unpack(args)) end) end)
+        end
+    end
+end
+
+-- 2. Сканер памяти для RemoteFunction (Добавление предмета и принятие инвайта)
+local function invokeAction(uuid, ...)
+    local targetRemote = nil
+    
+    -- Ищем RemoteFunction, привязанный к нашему UUID в памяти
+    for _, obj in ipairs(getgc(true)) do
+        if type(obj) == "table" then
+            local hasId = false
+            local tempRem = nil
+            for k, v in pairs(obj) do
+                if k == uuid or v == uuid then hasId = true end
+                if typeof(v) == "Instance" and v:IsA("RemoteFunction") then tempRem = v end
+            end
+            if hasId and tempRem then targetRemote = tempRem; break end
+        end
+    end
+    
+    if not targetRemote then
+        -- Глубокий поиск в константах, если таблица не найдена
+        for _, obj in ipairs(getgc()) do
+            if type(obj) == "function" and not is_synapse_function(obj) then
+                local s, consts = pcall(debug.getconstants, obj)
+                if s and table.find(consts, uuid) then
+                    local s2, upvals = pcall(debug.getupvalues, obj)
+                    if s2 then
+                        for _, v in pairs(upvals) do
+                            if typeof(v) == "Instance" and v:IsA("RemoteFunction") then
+                                targetRemote = v; break
+                            end
+                        end
+                    end
+                end
+            end
+            if targetRemote then break end
+        end
+    end
+    
+    if targetRemote then
+        return targetRemote:InvokeServer(uuid, ...)
+    else
+        warn("[❌] Критическая ошибка: Не найден RemoteFunction для UUID:", uuid)
+        return false
+    end
+end
 
 -- ==========================================
 -- ФУНКЦИИ ПОМОЩНИКИ
@@ -88,20 +142,17 @@ end
 local function waitForBuyerReady(timeout)
     timeout = timeout or 60
     local startTime = tick()
-    
     local tradeUI = LocalPlayer.PlayerGui:WaitForChild("TradeLiveTrade"):WaitForChild("TradeLiveTrade")
     local otherFrame = tradeUI:WaitForChild("Other")
     
-    print("[⏳] Ожидание готовности покупателя (умный чек UI)...")
-    
+    print("[⏳] Ожидание готовности покупателя...")
     while tick() - startTime < timeout do
         local readyFrame = otherFrame:FindFirstChild("Ready")
         local readyButton = otherFrame:FindFirstChild("ReadyButton")
         
-        -- Проверяем любые визуальные изменения, говорящие о том, что покупатель готов
         local isReady = false
         if readyFrame and readyFrame.Visible == true then isReady = true end
-        if readyButton and readyButton.Visible == false then isReady = true end -- Кнопка могла пропасть после нажатия
+        if readyButton and readyButton.Visible == false then isReady = true end
         
         if isReady then
             print("[✅] Покупатель подтвердил готовность!")
@@ -109,75 +160,79 @@ local function waitForBuyerReady(timeout)
         end
         task.wait(0.5)
     end
-    
     warn("[⚠️] Таймаут: покупатель не нажал Ready.")
     return false
 end
 
 -- ==========================================
--- ОСНОВНАЯ ЛОГИКА ТРЕЙДА
+-- ПРОСЛУШКА ВХОДЯЩИХ ИНВАЙТОВ (Универсальная)
 -- ==========================================
-INCOMING_TRADE_RE.OnClientEvent:Connect(function(tradeSessionId, tradeData)
-    if type(tradeData) ~= "table" or not tradeData.fromUsername then return end
-    
-    local senderName = string.lower(tradeData.fromUsername)
-    print(string.format("[📩] Входящий трейд от: %s", tradeData.fromUsername))
-    
-    if not activeOrders[senderName] then
-        print("[🛑] Игрока нет в активных заказах. Игнорируем.")
-        return
+for _, remote in ipairs(Net:GetChildren()) do
+    if remote:IsA("RemoteEvent") then
+        remote.OnClientEvent:Connect(function(tradeSessionId, tradeData)
+            if type(tradeData) ~= "table" or not tradeData.fromUsername then return end
+            
+            local senderName = string.lower(tradeData.fromUsername)
+            print(string.format("[📩] Входящий трейд от: %s", tradeData.fromUsername))
+            
+            if not activeOrders[senderName] then
+                print("[🛑] Игрока нет в активных заказах. Игнорируем.")
+                return
+            end
+            
+            local orderInfo = activeOrders[senderName]
+            print(string.format("[✅] Покупатель подтвержден. Принимаем инвайт..."))
+            
+            -- Динамический вызов принятия
+            local accSuccess, accErr = pcall(function()
+                return invokeAction(ACCEPT_ACTION_UUID, tradeSessionId)
+            end)
+            
+            if not accSuccess then
+                warn("[❌] Ошибка принятия инвайта:", tostring(accErr))
+                return
+            end
+            
+            task.spawn(function()
+                print("[⏳] Ожидание прогрузки окна трейда...")
+                task.wait(2.5)
+                
+                local slotNumber = findSlotInTradeUI(orderInfo.item_name)
+                if not slotNumber then
+                    warn("[❌] Предмет не найден в UI: " .. orderInfo.item_name)
+                    reportTask(orderInfo.task_id, "failed", "Предмет отсутствует")
+                    return
+                end
+                
+                local itemData = getItemDataFromGC(orderInfo.item_name) or {
+                    ["Index"] = orderInfo.item_name,
+                    ["UUID"] = "bad6d3b6-15b1-46e0-8476-957d6c3b9f6e",
+                    ["LastCollect"] = os.time()
+                }
+                
+                print(string.format("[📦] Добавляем предмет '%s' (Слот %d)...", orderInfo.item_name, slotNumber))
+                invokeAction(ADD_ITEM_ACTION_UUID, slotNumber, itemData)
+                
+                task.wait(1)
+                print("[✅] Отправляем свой статус Ready.")
+                fireAction(READY_ACTION_UUID)
+                
+                if not waitForBuyerReady(60) then
+                    reportTask(orderInfo.task_id, "failed", "Покупатель AFK")
+                    return
+                end
+                
+                task.wait(1.5)
+                
+                print("[🎉] Жмем финальный Accept. Сделка закрывается.")
+                fireAction(ACCEPT_FINAL_ACTION_UUID)
+                
+                reportTask(orderInfo.task_id, "completed", "Успешно выдано")
+                activeOrders[senderName] = nil
+            end)
+        end)
     end
-    
-    local orderInfo = activeOrders[senderName]
-    print(string.format("[✅] Покупатель подтвержден. Принимаем инвайт..."))
-    
-    local accSuccess, accErr = pcall(function()
-        return ACCEPT_TRADE_RF:InvokeServer(ACCEPT_ACTION_UUID, tradeSessionId)
-    end)
-    
-    if not accSuccess then
-        warn("[❌] Ошибка принятия инвайта:", tostring(accErr))
-        return
-    end
-    
-    task.spawn(function()
-        print("[⏳] Ожидание прогрузки окна трейда...")
-        task.wait(2)
-        
-        local slotNumber = findSlotInTradeUI(orderInfo.item_name)
-        if not slotNumber then
-            warn("[❌] Предмет не найден в UI: " .. orderInfo.item_name)
-            reportTask(orderInfo.task_id, "failed", "Предмет отсутствует")
-            return
-        end
-        
-        local itemData = getItemDataFromGC(orderInfo.item_name) or {
-            ["Index"] = orderInfo.item_name,
-            ["UUID"] = "bad6d3b6-15b1-46e0-8476-957d6c3b9f6e", -- Фолбэк
-            ["LastCollect"] = os.time()
-        }
-        
-        print(string.format("[📦] Добавляем предмет '%s' (Слот %d)...", orderInfo.item_name, slotNumber))
-        ADD_ITEM_RF:InvokeServer(ADD_ITEM_ACTION_UUID, slotNumber, itemData)
-        
-        task.wait(1)
-        print("[✅] Отправляем свой статус Ready.")
-        READY_RE:FireServer(READY_ACTION_UUID)
-        
-        if not waitForBuyerReady(60) then
-            reportTask(orderInfo.task_id, "failed", "Покупатель AFK")
-            return
-        end
-        
-        task.wait(1.5) -- Защитная пауза перед финальным аккордом
-        
-        print("[🎉] Жмем финальный Accept. Сделка закрывается.")
-        ACCEPT_FINAL_RE:FireServer(ACCEPT_FINAL_ACTION_UUID)
-        
-        reportTask(orderInfo.task_id, "completed", "Успешно выдано")
-        activeOrders[senderName] = nil
-    end)
-end)
+end
 
 -- ==========================================
 -- ОПРОС СЕРВЕРА
@@ -201,5 +256,5 @@ local function pollServer()
     end
 end
 
-print("[🚀 Скрипт активен] Бот запущен, слушает сервер и интерфейс...")
+print("[🚀 Скрипт активен] Бот запущен (Режим обхода обфускации включен)...")
 task.spawn(pollServer)
