@@ -1,0 +1,1632 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+
+local LP = Players.LocalPlayer
+local Trade = ReplicatedStorage:WaitForChild("Trade")
+local InventoryRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Inventory")
+local Sync = require(ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"))
+
+local VALUES_URL = "https://raw.githubusercontent.com/volmaksDev/My-Scripts/refs/heads/main/Additional/mm2_values.json"
+
+local Entries = {}
+local ByNorm = {}
+local ValuesCount = 0
+local lastYour, lastTheir = "", ""
+local lastOfferToken = nil
+local alreadyOffered = {}
+local lastOfferChangeAt = 0
+local opponentAccepted = false
+local busy = false
+local debounceToken = 0
+local latestTheirOffer = {}
+local latestOurOffer = {}
+local acceptScheduled = false
+local lastHandledTheirFp = ""
+local tradeStartedAt = 0
+local inTrade = false
+
+local pendingRequestAt = 0
+local pendingRequestName = nil
+
+local prefix = "[Trade Bot]"
+
+local ALLOWED_RARITIES = {
+	godly = true,
+	unique = true,
+	ancient = true,
+}
+
+local hub = {
+	vars = {
+		Enabled = true,
+		AutoOffer = true,
+		AutoAccept = true,
+		AutoAcceptRequest = true,
+		MinProfit = 1.15,
+		MaxStacks = 4,
+		AutoSendTrades = true,
+		SendInterval = 2,
+		SendRoundPause = 1,
+		AcceptDelay = 0.4,
+		ClientAcceptCooldown = 6,
+		MaxTradeSeconds = 180,
+		Debug = false,
+		PendingRequestSeconds = 25,
+		PreferHighTier = true,
+	},
+	funcs = {},
+	subfuncs = {},
+}
+
+hub.subfuncs.Log = function(...)
+	if hub.vars.Debug then
+		print(prefix, ...)
+	end
+end
+
+hub.subfuncs.Norm = function(s)
+	if typeof(s) ~= "string" then
+		return ""
+	end
+	s = s:lower()
+	s = s:gsub("['’]", "")
+	s = s:gsub("^c%.%s*", "chroma ")
+	s = s:gsub("%s+", " ")
+	return (s:match("^%s*(.-)%s*$")) or ""
+end
+
+hub.subfuncs.ParseNumeric = function(v)
+	if typeof(v) == "number" then
+		return v
+	end
+	if typeof(v) ~= "string" then
+		return nil
+	end
+	local s = v:gsub(",", ""):gsub("%s+", "")
+	if s:match("^%-?%d+%.?%d*$") then
+		return tonumber(s)
+	end
+	return nil
+end
+
+hub.subfuncs.NormRarity = function(r)
+	if r == nil then
+		return ""
+	end
+	r = tostring(r):lower():gsub("%s+", "")
+	if r:find("chroma", 1, true) then
+		return "chroma"
+	end
+	if r:find("ancient", 1, true) then
+		return "ancient"
+	end
+	if r:find("unique", 1, true) then
+		return "unique"
+	end
+	if r:find("vintage", 1, true) then
+		return "vintage"
+	end
+	if r:find("godly", 1, true) then
+		return "godly"
+	end
+	if r:find("legend", 1, true) then
+		return "legendary"
+	end
+	if r:find("uncommon", 1, true) then
+		return "uncommon"
+	end
+	if r:find("rare", 1, true) and not r:find("uncommon", 1, true) then
+		return "rare"
+	end
+	if r:find("common", 1, true) and not r:find("uncommon", 1, true) then
+		return "common"
+	end
+	return r
+end
+
+hub.subfuncs.IsAllowedRarity = function(r)
+	local n = hub.subfuncs.NormRarity(r)
+	if n == "chroma" then
+		return true
+	end
+	return ALLOWED_RARITIES[n] == true
+end
+
+hub.subfuncs.AddEntry = function(key, value, meta)
+	if typeof(value) ~= "number" or value < 1 or not key or key == "" then
+		return
+	end
+	local n = hub.subfuncs.Norm(key)
+	if n == "" then
+		return
+	end
+	local rarityName = ""
+	if meta then
+		rarityName = tostring(meta.rarityName or meta.category or ""):lower()
+		if rarityName:match("^%d+$") then
+			rarityName = ""
+		end
+		if rarityName == "" then
+			rarityName = hub.subfuncs.NormRarity(meta.rarity)
+			if rarityName:match("^%d+$") then
+				rarityName = ""
+			end
+		end
+		rarityName = hub.subfuncs.NormRarity(rarityName)
+	end
+	if n:find("chroma", 1, true) and rarityName == "" then
+		rarityName = "chroma"
+	end
+	local e = {
+		key = key,
+		norm = n,
+		value = value,
+		rarity = rarityName,
+		rarityName = rarityName,
+		category = meta and tostring(meta.category or "") or "",
+		isChroma = n:find("chroma", 1, true) ~= nil or rarityName == "chroma",
+	}
+	Entries[#Entries + 1] = e
+	local bucket = ByNorm[n]
+	if not bucket then
+		bucket = {}
+		ByNorm[n] = bucket
+	end
+	bucket[#bucket + 1] = e
+	ValuesCount += 1
+end
+
+hub.subfuncs.GetRequest = function()
+	return (http and http.request) or http_request or request
+end
+
+hub.subfuncs.ParseItemId = function(itemId)
+	local id = tostring(itemId or "")
+	local chroma = false
+	local work = id
+	if work:lower():find("chroma", 1, true) then
+		chroma = true
+		work = work:gsub("[Cc]hroma", "")
+	end
+	local base, kindLetter, year = work:match("^(.+)_([GKgk])_(%d%d%d%d)$")
+	if base then
+		base = base:gsub("_+$", ""):gsub("^_+", "")
+		return base, (kindLetter:upper() == "G") and "gun" or "knife", year, chroma
+	end
+	base, kindLetter = work:match("^(.+)_([GKgk])$")
+	if base then
+		base = base:gsub("_+$", ""):gsub("^_+", "")
+		return base, (kindLetter:upper() == "G") and "gun" or "knife", nil, chroma
+	end
+	year = id:match("(20%d%d)")
+	base = work:match("^([%w%s']+)") or work
+	base = base:gsub("_+$", ""):gsub("^_+", "")
+	return base, nil, year, chroma
+end
+
+hub.subfuncs.WeaponKind = function(itemType, itemId, info, parsedKind)
+	if parsedKind then
+		return parsedKind
+	end
+	local t = tostring(itemType or ""):lower()
+	if t:find("gun", 1, true) then
+		return "gun"
+	end
+	if t:find("knife", 1, true) then
+		return "knife"
+	end
+	if info then
+		local n = tostring(info.ItemName or info.Name or ""):lower()
+		if n:find("%(gun%)") then
+			return "gun"
+		end
+		if n:find("%(knife%)") then
+			return "knife"
+		end
+	end
+	return nil
+end
+
+hub.subfuncs.ScoreEntry = function(entry, wantKind, wantYear, wantRarity, queryNorm, wantChroma)
+	local score = 0
+	local key = entry.norm
+	local entryChroma = entry.isChroma == true
+		or key:find("chroma", 1, true) ~= nil
+		or hub.subfuncs.NormRarity(entry.rarityName or entry.rarity or entry.category) == "chroma"
+
+	if wantChroma and not entryChroma then
+		return -100
+	end
+	if not wantChroma and entryChroma then
+		return -100
+	end
+	if wantChroma and entryChroma then
+		score += 60
+	end
+
+	local keyBase = key
+		:gsub("%s*chroma%s*", " ")
+		:gsub("%s*%(gun%)", "")
+		:gsub("%s*%(knife%)", "")
+		:gsub("%s*%[.-%]", "")
+		:gsub("%s+", " ")
+		:match("^%s*(.-)%s*$") or key
+
+	local queryBase = queryNorm
+		:gsub("%s*chroma%s*", " ")
+		:gsub("%s*%(gun%)", "")
+		:gsub("%s*%(knife%)", "")
+		:gsub("%s*%[.-%]", "")
+		:gsub("%s+", " ")
+		:match("^%s*(.-)%s*$") or queryNorm
+
+	if keyBase ~= queryBase then
+		if #keyBase > #queryBase then
+			local rest = keyBase:sub(#queryBase + 1):match("^%s*(.+)$") or ""
+			rest = rest:lower()
+			if rest ~= ""
+				and not rest:match("^%(gun%)$")
+				and not rest:match("^%(knife%)$")
+				and not rest:match("^%[%w+%]$")
+				and not rest:match("^20%d%d$")
+			then
+				return -100
+			end
+		else
+			return -100
+		end
+	end
+
+	local hasGun = key:find("%(gun%)", 1, false) ~= nil
+	local hasKnife = key:find("%(knife%)", 1, false) ~= nil
+
+	if wantKind == "gun" then
+		if hasGun then score += 50
+		elseif hasKnife then return -1 end
+	elseif wantKind == "knife" then
+		if hasKnife then score += 50
+		elseif hasGun then return -1 end
+	end
+
+	local yearInKey = key:match("(20%d%d)")
+	if wantYear then
+		if yearInKey == wantYear then score += 40
+		elseif yearInKey and yearInKey ~= wantYear then score -= 30 end
+	end
+
+	local er = hub.subfuncs.NormRarity(entry.rarityName or entry.rarity or entry.category)
+	local wr = hub.subfuncs.NormRarity(wantRarity)
+	if wantChroma then wr = "chroma" end
+	if wr ~= "" and er ~= "" and wr ~= er then
+		if not (wantChroma and er == "chroma") then
+			return -100
+		end
+	end
+	if wr ~= "" and er == wr then score += 40 end
+	if key == queryNorm then score += 30 end
+	if keyBase == queryBase then score += 25 end
+	if hasGun or hasKnife then score += 5 end
+	if key:find("%[", 1, true) then score += 5 end
+	return score
+end
+
+hub.subfuncs.DeclineTrade = function(reason)
+	hub.subfuncs.Log("DeclineTrade:", reason or "")
+	acceptScheduled = false
+	busy = false
+	pcall(function() Trade.CancelAccept:FireServer() end)
+	pcall(function() Trade.DeclineTrade:FireServer() end)
+end
+
+hub.subfuncs.IsChromaId = function(itemId, name, info)
+	local s = (tostring(itemId or "") .. " " .. tostring(name or "")):lower()
+	if s:find("chroma", 1, true) then
+		return true
+	end
+	if info then
+		local n = tostring(info.ItemName or info.Name or info.DisplayName or ""):lower()
+		if n:find("chroma", 1, true) then
+			return true
+		end
+		local r = tostring(info.Rarity or info.ItemRarity or ""):lower()
+		if r:find("chroma", 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+hub.subfuncs.StripChromaPrefix = function(s)
+	s = tostring(s or "")
+	s = s:gsub("^[Cc]hroma%s+", "")
+	s = s:gsub("^c%.%s*", "")
+	return s
+end
+
+hub.subfuncs.LookupValue = function(name, itemId, itemType, info)
+	local idBase, idKind, idYear, idChroma = hub.subfuncs.ParseItemId(itemId)
+	local kind = hub.subfuncs.WeaponKind(itemType, itemId, info, idKind)
+	local rarity = info and (info.Rarity or info.ItemRarity) or nil
+	local displayName = name or idBase
+	local wantChroma = idChroma or hub.subfuncs.IsChromaId(itemId, displayName, info)
+	local baseName = hub.subfuncs.StripChromaPrefix(displayName)
+	local baseId = hub.subfuncs.StripChromaPrefix(idBase or "")
+
+	local queries = {}
+	local function addQ(s)
+		if s and s ~= "" then queries[#queries + 1] = s end
+	end
+
+	if wantChroma then
+		addQ("Chroma " .. baseName)
+		addQ("Chroma " .. baseId)
+		addQ("C. " .. baseName)
+		if kind == "gun" then
+			addQ("Chroma " .. baseName .. " (Gun)")
+			addQ("Chroma " .. baseId .. " (Gun)")
+		elseif kind == "knife" then
+			addQ("Chroma " .. baseName .. " (Knife)")
+			addQ("Chroma " .. baseId .. " (Knife)")
+		end
+		addQ(displayName)
+		addQ(idBase)
+	else
+		addQ(displayName)
+		addQ(idBase)
+		addQ(baseName)
+		addQ(baseId)
+		if kind == "gun" then
+			addQ(displayName .. " (Gun)")
+			addQ((idBase or displayName) .. " (Gun)")
+			addQ(baseName .. " (Gun)")
+			if idYear then
+				addQ(string.format("%s (Gun) [XMAS%s]", displayName, idYear))
+				addQ(string.format("%s (Gun) [HALLOWS%s]", displayName, idYear))
+			end
+		elseif kind == "knife" then
+			addQ(displayName .. " (Knife)")
+			addQ((idBase or displayName) .. " (Knife)")
+			addQ(baseName .. " (Knife)")
+			if idYear then
+				addQ(string.format("%s (Knife) [XMAS%s]", displayName, idYear))
+				addQ(string.format("%s (Knife) [HALLOWS%s]", displayName, idYear))
+			end
+		end
+	end
+	if info then
+		addQ(info.ItemName)
+		addQ(info.Name)
+	end
+
+	local best, bestScore = nil, -math.huge
+	local seen = {}
+
+	for _, q in ipairs(queries) do
+		local n = hub.subfuncs.Norm(q)
+		local bucket = ByNorm[n]
+		if bucket then
+			for _, entry in ipairs(bucket) do
+				if not seen[entry] then
+					seen[entry] = true
+					local sc = hub.subfuncs.ScoreEntry(entry, kind, idYear, rarity, n, wantChroma)
+					if sc > bestScore then
+						bestScore = sc
+						best = entry
+					end
+				end
+			end
+		end
+	end
+
+	if not best or bestScore < 40 then
+		local baseN = hub.subfuncs.Norm(wantChroma and ("chroma " .. baseName) or baseName)
+		if baseN ~= "" then
+			for _, entry in ipairs(Entries) do
+				if not seen[entry] then
+					local en = entry.norm
+					local enBase = en
+						:gsub("%s*chroma%s*", " ")
+						:gsub("%s*%(gun%)", "")
+						:gsub("%s*%(knife%)", "")
+						:gsub("%s*%[.-%]", "")
+						:gsub("%s+", " ")
+						:match("^%s*(.-)%s*$") or en
+					local cmp = hub.subfuncs.Norm(baseName)
+					if enBase == cmp or en == baseN or (wantChroma and en:find("chroma", 1, true) and enBase == cmp) then
+						local sc = hub.subfuncs.ScoreEntry(entry, kind, idYear, rarity, baseN, wantChroma)
+						if sc > bestScore then
+							bestScore = sc
+							best = entry
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if best and bestScore >= 40 then
+		if typeof(best.value) == "number" and best.value >= 1 then
+			return best.value, best.key, bestScore
+		end
+		return nil, best.key, bestScore
+	end
+	return nil, nil, nil
+end
+
+hub.subfuncs.GetItemInfo = function(itemType, itemId)
+	local bucket = Sync[itemType]
+	if typeof(bucket) ~= "table" then
+		return nil
+	end
+	local info = bucket[itemId] or bucket[tostring(itemId)] or bucket[tonumber(itemId)]
+	return typeof(info) == "table" and info or nil
+end
+
+hub.subfuncs.ParseEntry = function(entry)
+	return entry[1] or entry.ItemID or entry.ItemId,
+		entry[2] or entry.Amount or 1,
+		entry[3] or entry.ItemType or entry.Type or "Weapons"
+end
+
+hub.subfuncs.Describe = function(entry)
+	local itemId, amount, itemType = hub.subfuncs.ParseEntry(entry)
+	local info = hub.subfuncs.GetItemInfo(itemType, itemId)
+	local name = tostring(itemId)
+	local rarity = "?"
+	if info then
+		name = info.ItemName or info.Name or info.DisplayName or name
+		rarity = info.Rarity or info.ItemRarity or rarity
+	end
+	local idBase, idKind, idYear = hub.subfuncs.ParseItemId(itemId)
+	local allowed = hub.subfuncs.IsAllowedRarity(rarity)
+	local value, matchedKey, score = nil, nil, nil
+	if allowed then
+		value, matchedKey, score = hub.subfuncs.LookupValue(name, itemId, itemType, info)
+	end
+	local amountN = tonumber(amount) or 1
+	local okVal = value and value >= 1
+	return {
+		id = itemId,
+		name = name,
+		rarity = tostring(rarity),
+		allowed = allowed,
+		amount = amountN,
+		type = tostring(itemType),
+		year = idYear,
+		kind = idKind or hub.subfuncs.WeaponKind(itemType, itemId, info, idKind),
+		value = okVal and value or nil,
+		matchedKey = matchedKey,
+		matchScore = score,
+		stackValue = okVal and (value * amountN) or nil,
+	}
+end
+
+hub.subfuncs.SumOffer = function(offer)
+	local total, known, unknown, ignored = 0, 0, 0, 0
+	for _, entry in ipairs(offer or {}) do
+		local d = hub.subfuncs.Describe(entry)
+		if not d.allowed then
+			ignored += 1
+		elseif d.value and d.value >= 1 then
+			total += d.stackValue
+			known += 1
+		else
+			unknown += 1
+		end
+	end
+	return total, known, unknown, ignored
+end
+
+hub.subfuncs.Fingerprint = function(offer)
+	local parts = {}
+	for i, entry in ipairs(offer or {}) do
+		local d = hub.subfuncs.Describe(entry)
+		parts[i] = string.format("%s:%s:x%d", d.type, tostring(d.id), d.amount)
+	end
+	table.sort(parts)
+	return table.concat(parts, "|")
+end
+
+hub.subfuncs.SecondsUntilAcceptReady = function()
+	local left = hub.vars.ClientAcceptCooldown - (tick() - lastOfferChangeAt)
+	return left > 0 and left or 0
+end
+
+hub.subfuncs.ReadGuiCooldownSeconds = function()
+	local pg = LP:FindFirstChild("PlayerGui")
+	if not pg then
+		return nil
+	end
+	local ok, sec = pcall(function()
+		for _, gui in ipairs(pg:GetDescendants()) do
+			if gui:IsA("TextLabel") or gui:IsA("TextButton") then
+				local n = (gui.Text or ""):match("[Pp]lease wait %((%d+)%)")
+				if n then
+					return tonumber(n)
+				end
+			end
+		end
+		return nil
+	end)
+	return ok and sec or nil
+end
+
+hub.subfuncs.IsOpponentAcceptedGui = function()
+	local pg = LP:FindFirstChild("PlayerGui")
+	if not pg then
+		return false
+	end
+	local ok, vis = pcall(function()
+		for _, d in ipairs(pg:GetDescendants()) do
+			if d.Name == "Accepted" and d.Parent and d.Parent.Name == "TheirOffer" then
+				return d.Visible == true
+			end
+		end
+		return false
+	end)
+	return ok and vis or false
+end
+
+hub.subfuncs.GetOwnedWeapons = function()
+	local ok, data = pcall(function()
+		return InventoryRemote.GetProfileData:InvokeServer(LP.Name)
+	end)
+	if not ok or typeof(data) ~= "table" then
+		warn(prefix.." GetProfileData failed:", data)
+		return {}
+	end
+	local owned = data.Weapons and data.Weapons.Owned
+	if typeof(owned) ~= "table" then
+		return {}
+	end
+	local list = {}
+	for dataId, amount in pairs(owned) do
+		local amt = tonumber(amount) or 0
+		if amt > 0 then
+			local info = hub.subfuncs.GetItemInfo("Weapons", dataId)
+			local name = info and (info.ItemName or info.Name) or tostring(dataId)
+			local rarity = info and (info.Rarity or info.ItemRarity) or "?"
+			if hub.subfuncs.IsAllowedRarity(rarity) then
+				local value = hub.subfuncs.LookupValue(name, dataId, "Weapons", info)
+				if value and value >= 1 then
+					list[#list + 1] = {
+						id = dataId,
+						name = name,
+						rarity = tostring(rarity),
+						amount = amt,
+						value = value,
+						type = "Weapons",
+					}
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		if a.value == b.value then
+			return a.amount > b.amount
+		end
+		return a.value < b.value
+	end)
+	return list
+end
+
+hub.subfuncs.OfferItem = function(dataId, itemType)
+	itemType = itemType or "Weapons"
+	local ok, err = pcall(function()
+		Trade.OfferItem:FireServer(dataId, itemType)
+	end)
+	if not ok then
+		warn(prefix.." OfferItem failed:", err)
+		return false
+	end
+	return true
+end
+
+hub.subfuncs.RemoveOfferItem = function(dataId, itemType)
+	itemType = itemType or "Weapons"
+	local ok, err = pcall(function()
+		Trade.RemoveOffer:FireServer(dataId, itemType)
+	end)
+	if not ok then
+		warn(prefix.." RemoveOffer failed:", err)
+		return false
+	end
+	return true
+end
+
+hub.subfuncs.ClearOurOffer = function(ourOffer)
+	if not ourOffer or #ourOffer == 0 then
+		return
+	end
+	hub.subfuncs.Log("clearing our offer (" .. #ourOffer .. " stacks)")
+	pcall(function()
+		Trade.CancelAccept:FireServer()
+	end)
+	for _, entry in ipairs(ourOffer) do
+		local itemId, amount, itemType = hub.subfuncs.ParseEntry(entry)
+		local amt = tonumber(amount) or 1
+		for _ = 1, amt do
+			hub.subfuncs.RemoveOfferItem(itemId, itemType)
+			task.wait(0.06)
+		end
+	end
+	alreadyOffered = {}
+end
+
+hub.subfuncs.SelectCounterOffer = function(theirTotal, inventory, currentOurTotal)
+	local budget = theirTotal / hub.vars.MinProfit - (currentOurTotal or 0)
+	if budget <= 0 then
+		return {}, 0
+	end
+
+	local sorted = table.clone(inventory)
+	table.sort(sorted, function(a, b)
+		if a.value == b.value then
+			return a.amount > b.amount
+		end
+		return a.value > b.value
+	end)
+
+	local selected = {}
+	local used = 0
+	local stacks = 0
+	local taken = {}
+
+	local function available(item)
+		return item.amount - (alreadyOffered[item.id] or 0) - (taken[item.id] or 0)
+	end
+
+	for _, item in ipairs(sorted) do
+		if stacks >= hub.vars.MaxStacks then
+			break
+		end
+		local avail = available(item)
+		if avail > 0 and item.value >= 1 and item.value <= budget + 1e-9 then
+			local maxN = math.floor((budget + 1e-9) / item.value)
+			local take = math.min(avail, maxN)
+			if take > 0 then
+				selected[#selected + 1] = {
+					id = item.id,
+					name = item.name,
+					amount = take,
+					value = item.value,
+					type = item.type,
+				}
+				used += item.value * take
+				budget -= item.value * take
+				stacks += 1
+				taken[item.id] = (taken[item.id] or 0) + take
+			end
+		end
+	end
+
+	if budget >= 1 and stacks < hub.vars.MaxStacks then
+		table.sort(sorted, function(a, b)
+			return a.value < b.value
+		end)
+		for _, item in ipairs(sorted) do
+			if stacks >= hub.vars.MaxStacks then
+				break
+			end
+			local avail = available(item)
+			if avail > 0 and item.value >= 1 and item.value <= budget + 1e-9 then
+				local maxN = math.floor((budget + 1e-9) / item.value)
+				local take = math.min(avail, maxN)
+				if take > 0 then
+					selected[#selected + 1] = {
+						id = item.id,
+						name = item.name,
+						amount = take,
+						value = item.value,
+						type = item.type,
+					}
+					used += item.value * take
+					budget -= item.value * take
+					stacks += 1
+					taken[item.id] = (taken[item.id] or 0) + take
+				end
+			end
+		end
+	end
+
+	return selected, used
+end
+
+hub.subfuncs.IsOfferProfitable = function(theirTotal, ourTotal)
+	if theirTotal <= 0 or ourTotal <= 0 then
+		return false
+	end
+	return theirTotal >= ourTotal * hub.vars.MinProfit
+end
+
+hub.subfuncs.IsOfferOverBudget = function(theirTotal, ourTotal)
+	if theirTotal <= 0 then
+		return ourTotal > 0
+	end
+	return ourTotal > (theirTotal / hub.vars.MinProfit) + 0.01
+end
+
+hub.subfuncs.PrintSide = function(label, offer, prevFp)
+	local fp = hub.subfuncs.Fingerprint(offer)
+	if fp == prevFp then
+		return fp, false
+	end
+	local total, known, unknown, ignored = hub.subfuncs.SumOffer(offer)
+	print(string.format(
+		"========== %s (%d stacks | value %s | known %d | ignored %d | unknown %d) ==========",
+		label,
+		#(offer or {}),
+		known > 0 and tostring(total) or "?",
+		known,
+		ignored,
+		unknown
+	))
+	if not offer or #offer == 0 then
+		print("  (empty)")
+		return fp, true
+	end
+	for i, entry in ipairs(offer) do
+		local d = hub.subfuncs.Describe(entry)
+		local valStr
+		if not d.allowed then
+			valStr = "IGNORED (" .. d.rarity .. ")"
+		elseif d.value and d.value >= 1 then
+			valStr = string.format("%s (x%d = %s) via %s", d.value, d.amount, d.stackValue, tostring(d.matchedKey))
+		else
+			valStr = string.format("N/A (no match for %s/%s/%s/%s)", d.name, tostring(d.kind), tostring(d.year), d.rarity)
+		end
+		print(string.format(
+			"  [%d] %s | %s | x%d | %s | ID:%s | Y:%s | Value: %s",
+			i,
+			d.name,
+			d.rarity,
+			d.amount,
+			d.type,
+			tostring(d.id),
+			tostring(d.year),
+			valStr
+		))
+	end
+	return fp, true
+end
+
+hub.subfuncs.ResetTradeState = function(reason)
+	hub.subfuncs.Log("reset trade state:", reason or "")
+	inTrade = false
+	tradeStartedAt = 0
+	pendingRequestAt = 0
+	pendingRequestName = nil
+	acceptScheduled = false
+	busy = false
+	alreadyOffered = {}
+	lastHandledTheirFp = ""
+	lastYour, lastTheir = "", ""
+	opponentAccepted = false
+end
+
+hub.funcs.LoadValues = function()
+	local req = hub.subfuncs.GetRequest()
+	if typeof(req) ~= "function" then
+		warn(prefix.." no request function")
+		return false
+	end
+	local ok, res = pcall(function()
+		return req({
+			Url = VALUES_URL,
+			Method = "GET",
+			Headers = { ["Accept"] = "application/json" },
+		})
+	end)
+	if not ok or typeof(res) ~= "table" then
+		warn(prefix.." request failed:", res)
+		return false
+	end
+	local status = res.StatusCode or res.Status or 0
+	local body = res.Body or res.body or ""
+	if status < 200 or status >= 300 or body == "" then
+		warn(prefix.." bad status", status, #body)
+		return false
+	end
+	local decodeOk, data = pcall(function()
+		return HttpService:JSONDecode(body)
+	end)
+	if not decodeOk or typeof(data) ~= "table" then
+		warn(prefix.." JSON decode failed")
+		return false
+	end
+
+	Entries = {}
+	ByNorm = {}
+	ValuesCount = 0
+
+	local meta = typeof(data.meta) == "table" and data.meta or {}
+
+	if typeof(data.byRarity) == "table" then
+		for rarityName, bucket in pairs(data.byRarity) do
+			if typeof(bucket) == "table" then
+				local rn = hub.subfuncs.NormRarity(rarityName)
+				for name, val in pairs(bucket) do
+					if typeof(val) == "number" and val >= 1 then
+						hub.subfuncs.AddEntry(tostring(name), val, {
+							rarityName = rn,
+							category = rn,
+						})
+					end
+				end
+			end
+		end
+	end
+
+	if typeof(data.values) == "table" then
+		for name, val in pairs(data.values) do
+			if typeof(val) == "number" and val >= 1 then
+				hub.subfuncs.AddEntry(tostring(name), val, meta[name])
+			end
+		end
+	end
+
+	for name, info in pairs(meta) do
+		if typeof(info) == "table" then
+			local num = hub.subfuncs.ParseNumeric(info.value)
+				or hub.subfuncs.ParseNumeric(info.valueText)
+				or hub.subfuncs.ParseNumeric(info.rawValue)
+			if num and num >= 1 then
+				hub.subfuncs.AddEntry(tostring(name), num, info)
+				if typeof(info.name) == "string" and info.name ~= name then
+					hub.subfuncs.AddEntry(info.name, num, info)
+				end
+			end
+		end
+	end
+
+	if typeof(data.aliases) == "table" then
+		for alias, target in pairs(data.aliases) do
+			local tBucket = ByNorm[hub.subfuncs.Norm(tostring(target))]
+			if tBucket and tBucket[1] and tBucket[1].value >= 1 then
+				hub.subfuncs.AddEntry(tostring(alias), tBucket[1].value, {
+					rarityName = tBucket[1].rarityName,
+					category = tBucket[1].category,
+				})
+			end
+		end
+	end
+
+	for name, info in pairs(meta) do
+		if typeof(info) == "table" and typeof(info.aliases) == "string" then
+			local a = info.aliases
+			if a ~= "" and a ~= "N/A" then
+				local tBucket = ByNorm[hub.subfuncs.Norm(name)]
+				local val = tBucket and tBucket[1] and tBucket[1].value
+				if not val then
+					val = hub.subfuncs.ParseNumeric(info.value) or hub.subfuncs.ParseNumeric(info.valueText)
+				end
+				if val and val >= 1 then
+					for part in a:gmatch("[^,]+") do
+						hub.subfuncs.AddEntry(part, val, info)
+					end
+				end
+			end
+		end
+	end
+
+	print(string.format(prefix.." values loaded: %d | updatedAt: %s", ValuesCount, tostring(data.updatedAt)))
+	return ValuesCount > 0
+end
+
+hub.subfuncs.CancelPendingRequest = function(reason)
+	print(prefix, "CancelPendingRequest:", reason or "", tostring(pendingRequestName))
+	pcall(function()
+		Trade.DeclineTrade:FireServer()
+	end)
+	pcall(function()
+		local r = Trade:FindFirstChild("CancelRequest") or Trade:FindFirstChild("DeclineRequest")
+		if r then
+			if r:IsA("RemoteEvent") then
+				r:FireServer()
+			elseif r:IsA("RemoteFunction") then
+				r:InvokeServer()
+			end
+		end
+	end)
+	pendingRequestAt = 0
+	pendingRequestName = nil
+end
+
+hub.funcs.SendTradeRound = function()
+	if not hub.vars.Enabled then return end
+	if not hub.vars.AutoSendTrades then return end
+	if inTrade then return end
+	if busy or acceptScheduled then return end
+
+	if pendingRequestAt > 0 then
+		local pendSec = tonumber(hub.vars.PendingRequestSeconds) or 25
+		if tick() - pendingRequestAt < pendSec then
+			return
+		end
+		hub.subfuncs.CancelPendingRequest("expired before next send")
+		task.wait(0.35)
+	end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if not hub.vars.Enabled or not hub.vars.AutoSendTrades then break end
+		if inTrade or busy or acceptScheduled then break end
+		if plr ~= LP and plr.Character then
+			local ok, err = pcall(function()
+				Trade.SendRequest:InvokeServer(plr)
+			end)
+			print(prefix, "SendRequest ->", plr.Name, ok and "OK" or tostring(err))
+			if ok then
+				pendingRequestAt = tick()
+				pendingRequestName = plr.Name
+				return
+			end
+			task.wait(hub.vars.SendInterval)
+		end
+	end
+end
+
+hub.funcs.OnTradeRequest = function(fromPlayer)
+	if not hub.vars.Enabled then return end
+	if not hub.vars.AutoAcceptRequest then return end
+	if inTrade or tradeStartedAt > 0 then return end
+	local name = (typeof(fromPlayer) == "Instance" and fromPlayer.Name) or tostring(fromPlayer)
+	hub.subfuncs.Log("incoming trade request from", name)
+	task.wait(0.15)
+	local ok, err = pcall(function()
+		Trade.AcceptRequest:FireServer()
+	end)
+	if ok then
+		hub.subfuncs.Log("AcceptRequest sent ->", name)
+	else
+		warn(prefix.." AcceptRequest failed:", err)
+	end
+end
+
+hub.funcs.RebuildOffer = function(theirTotal)
+	local inv = hub.subfuncs.GetOwnedWeapons()
+	if #inv == 0 then
+		warn(prefix.." inventory empty or no Godly/Unique/Ancient")
+		return
+	end
+	alreadyOffered = {}
+	local selected, addValue = hub.subfuncs.SelectCounterOffer(theirTotal, inv, 0)
+	local budget = theirTotal / hub.vars.MinProfit
+	if #selected == 0 then
+		hub.subfuncs.Log(string.format("no items fit budget %.2f (their %.2f)", budget, theirTotal))
+		return
+	end
+	hub.subfuncs.Log(string.format(
+		"placing offer | their=%.2f budget<=%.2f us~=%.2f stacks=%d",
+		theirTotal,
+		budget,
+		addValue,
+		#selected
+	))
+	for _, item in ipairs(selected) do
+		hub.subfuncs.Log(string.format("  + %s x%d (%.2f) [%s]", item.name, item.amount, item.value * item.amount, item.rarity or "?"))
+		for _ = 1, item.amount do
+			hub.subfuncs.OfferItem(item.id, item.type)
+			task.wait(0.07)
+		end
+		alreadyOffered[item.id] = (alreadyOffered[item.id] or 0) + item.amount
+	end
+	local pct = addValue > 0 and ((theirTotal - addValue) / addValue * 100) or 0
+	hub.subfuncs.Log(string.format(
+		"done | us=%.2f them=%.2f diff=%+.2f (%.1f%%)",
+		addValue,
+		theirTotal,
+		theirTotal - addValue,
+		pct
+	))
+end
+
+hub.funcs.ScheduleAccept = function()
+	if not hub.vars.Enabled then return end
+	if not hub.vars.AutoAccept then
+		return
+	end
+	if acceptScheduled then
+		return
+	end
+	acceptScheduled = true
+	task.spawn(function()
+		while acceptScheduled do
+			local left = hub.subfuncs.SecondsUntilAcceptReady()
+			local guiLeft = hub.subfuncs.ReadGuiCooldownSeconds()
+			if guiLeft and guiLeft > left then
+				left = guiLeft
+			end
+			if left <= 0 then
+				break
+			end
+			hub.subfuncs.Log(string.format(
+				"accept cooldown... %.1fs (opponentAccepted=%s)",
+				left,
+				tostring(opponentAccepted or hub.subfuncs.IsOpponentAcceptedGui())
+			))
+			task.wait(math.min(left, 1))
+		end
+		if not acceptScheduled then
+			return
+		end
+		task.wait(hub.vars.AcceptDelay)
+		if not acceptScheduled then
+			return
+		end
+
+		local theirOffer = latestTheirOffer or {}
+		local ourOffer = latestOurOffer or {}
+		local theirTotal = hub.subfuncs.SumOffer(theirOffer)
+		local ourTotal = hub.subfuncs.SumOffer(ourOffer)
+		local theirCount = #theirOffer
+		local ourCount = #ourOffer
+
+		hub.subfuncs.Log(string.format(
+			"pre-accept check | them=%.2f(%d) us=%.2f(%d) token=%s opponentAccepted=%s",
+			theirTotal,
+			theirCount,
+			ourTotal,
+			ourCount,
+			tostring(lastOfferToken),
+			tostring(opponentAccepted or hub.subfuncs.IsOpponentAcceptedGui())
+		))
+
+		if theirCount == 0 or ourCount == 0 then
+			hub.subfuncs.Log("pre-accept ABORT - empty side")
+			acceptScheduled = false
+			return
+		end
+		if theirTotal < 1 or ourTotal < 1 then
+			hub.subfuncs.Log("pre-accept ABORT - no allowed-tier value")
+			acceptScheduled = false
+			return
+		end
+		if theirTotal < ourTotal * hub.vars.MinProfit then
+			hub.subfuncs.Log(string.format(
+				"pre-accept ABORT - not in profit (need them >= %.2f, have %.2f)",
+				ourTotal * hub.vars.MinProfit,
+				theirTotal
+			))
+			acceptScheduled = false
+			if not busy then
+				busy = true
+				pcall(hub.funcs.EvaluateAndFix, theirOffer, ourOffer)
+				busy = false
+			end
+			return
+		end
+		if ourTotal > (theirTotal / hub.vars.MinProfit) + 0.01 then
+			hub.subfuncs.Log("pre-accept ABORT - over budget")
+			acceptScheduled = false
+			if not busy then
+				busy = true
+				pcall(hub.funcs.EvaluateAndFix, theirOffer, ourOffer)
+				busy = false
+			end
+			return
+		end
+		if hub.subfuncs.SecondsUntilAcceptReady() > 0 then
+			hub.subfuncs.Log("pre-accept - cooldown restarted, reschedule")
+			acceptScheduled = false
+			hub.funcs.ScheduleAccept()
+			return
+		end
+		if not lastOfferToken then
+			hub.subfuncs.Log("pre-accept ABORT - no LastOffer token")
+			acceptScheduled = false
+			return
+		end
+
+		local ok, err = pcall(function()
+			Trade.AcceptTrade:FireServer(game.PlaceId * 3, lastOfferToken)
+		end)
+		if ok then
+			hub.subfuncs.Log(string.format(
+				"AcceptTrade sent | us=%.2f them=%.2f (+%.1f%%)",
+				ourTotal,
+				theirTotal,
+				(theirTotal - ourTotal) / ourTotal * 100
+			))
+		else
+			warn(prefix.." AcceptTrade failed:", err)
+		end
+		acceptScheduled = false
+	end)
+end
+
+hub.funcs.EvaluateAndFix = function(theirOffer, ourOffer)
+	if not hub.vars.Enabled then return end
+	if not hub.vars.AutoOffer then
+		return
+	end
+
+	local theirFp = hub.subfuncs.Fingerprint(theirOffer)
+	local theirTotal, theirKnown, theirUnknown, theirIgnored = hub.subfuncs.SumOffer(theirOffer)
+	local ourTotal = hub.subfuncs.SumOffer(ourOffer)
+	local theirCount = #(theirOffer or {})
+	local ourCount = #(ourOffer or {})
+
+	if theirCount == 0 then
+		if ourCount > 0 then
+			hub.subfuncs.Log("they cleared offer -> clearing ours")
+			hub.subfuncs.ClearOurOffer(ourOffer)
+		end
+		lastHandledTheirFp = theirFp
+		acceptScheduled = false
+		return
+	end
+
+	if theirTotal < 1 then
+		hub.subfuncs.Log(string.format(
+			"their offer has no Godly/Unique/Ancient value (ignored %d low-tier) -> clear ours",
+			theirIgnored or 0
+		))
+		acceptScheduled = false
+		if ourCount > 0 then
+			hub.subfuncs.ClearOurOffer(ourOffer)
+		end
+		lastHandledTheirFp = theirFp
+		return
+	end
+
+	local theirChanged = theirFp ~= lastHandledTheirFp
+	local profitable = hub.subfuncs.IsOfferProfitable(theirTotal, ourTotal)
+	local over = hub.subfuncs.IsOfferOverBudget(theirTotal, ourTotal)
+	local needOffer = ourCount == 0
+
+	hub.subfuncs.Log(string.format(
+		"check | them=%.2f(%d) us=%.2f(%d) profit=%s over=%s changed=%s cd=%.1fs",
+		theirTotal, theirCount, ourTotal, ourCount,
+		tostring(profitable), tostring(over), tostring(theirChanged),
+		hub.subfuncs.SecondsUntilAcceptReady()
+	))
+
+	if theirChanged or needOffer or over or not profitable then
+		hub.subfuncs.Log("rebuild offer (their change / missing / bad margin)")
+		acceptScheduled = false
+
+		if ourCount > 0 then
+			hub.subfuncs.ClearOurOffer(ourOffer)
+			task.wait(0.3)
+		else
+			alreadyOffered = {}
+			pcall(function()
+				Trade.CancelAccept:FireServer()
+			end)
+		end
+
+		hub.funcs.RebuildOffer(theirTotal)
+		lastHandledTheirFp = theirFp
+
+		if hub.vars.AutoAccept then
+			task.defer(function()
+				task.wait(0.6)
+				local t2 = hub.subfuncs.SumOffer(latestTheirOffer)
+				local o2 = hub.subfuncs.SumOffer(latestOurOffer)
+				if t2 >= 1 and o2 >= 1
+					and t2 >= o2 * hub.vars.MinProfit
+					and o2 <= (t2 / hub.vars.MinProfit) + 0.01
+				then
+					hub.funcs.ScheduleAccept()
+				else
+					hub.subfuncs.Log(string.format("post-rebuild skip accept | them=%.2f us=%.2f", t2, o2))
+				end
+			end)
+		end
+		return
+	end
+
+	hub.subfuncs.Log("offer OK - keep")
+	lastHandledTheirFp = theirFp
+	if hub.vars.AutoAccept then
+		hub.funcs.ScheduleAccept()
+	end
+end
+
+hub.funcs.OnOfferChanged = function(theirOffer, ourOffer)
+	latestTheirOffer = theirOffer or {}
+	latestOurOffer = ourOffer or {}
+	acceptScheduled = false
+	debounceToken += 1
+	local myToken = debounceToken
+	task.spawn(function()
+		task.wait(0.45)
+		if myToken ~= debounceToken then
+			return
+		end
+		if busy then
+			return
+		end
+		busy = true
+		local ok, err = pcall(hub.funcs.EvaluateAndFix, latestTheirOffer, latestOurOffer)
+		if not ok then
+			warn(prefix.." evaluate error:", err)
+		end
+		busy = false
+	end)
+end
+
+hub.funcs.OnUpdateTrade = function(data)
+	if typeof(data) ~= "table" then
+		return
+	end
+	if data.LastOffer ~= nil then
+		lastOfferToken = data.LastOffer
+	end
+
+	local myKey, theirKey
+	if data.Player1 and data.Player1.Player == LP then
+		myKey, theirKey = "Player1", "Player2"
+	elseif data.Player2 and data.Player2.Player == LP then
+		myKey, theirKey = "Player2", "Player1"
+	else
+		return
+	end
+
+	local theirPlayer = data[theirKey] and data[theirKey].Player
+	local theirName = theirPlayer and theirPlayer.Name or "?"
+	local yourOffer = data[myKey] and data[myKey].Offer or {}
+	local theirOffer = data[theirKey] and data[theirKey].Offer or {}
+	latestOurOffer = yourOffer or {}
+	latestTheirOffer = theirOffer or {}
+
+	local yFp, yChanged = hub.subfuncs.PrintSide("YOUR OFFER", yourOffer, lastYour)
+	local tFp, tChanged = hub.subfuncs.PrintSide("THEIR OFFER (" .. theirName .. ")", theirOffer, lastTheir)
+	lastYour, lastTheir = yFp, tFp
+
+	if yChanged or tChanged then
+		lastOfferChangeAt = tick()
+		opponentAccepted = false
+		local yTotal = hub.subfuncs.SumOffer(yourOffer)
+		local tTotal = hub.subfuncs.SumOffer(theirOffer)
+		local diff = tTotal - yTotal
+		local pct = yTotal > 0 and (diff / yTotal * 100) or 0
+		print(string.format(
+			"[Trade] vs %s | You: %s | Them: %s | Diff: %+d (%.1f%%) | cd=%.1fs",
+			theirName,
+			tostring(yTotal),
+			tostring(tTotal),
+			diff,
+			pct,
+			hub.subfuncs.SecondsUntilAcceptReady()
+		))
+		hub.funcs.OnOfferChanged(theirOffer, yourOffer)
+	end
+end
+
+do
+	local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+	local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
+	local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+	local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+
+	local Options = Library.Options
+	local Toggles = Library.Toggles
+
+	local Window = Library:CreateWindow({
+		Title = "MM2 Trade Bot",
+		Footer = "volmaks",
+		NotifySide = "Right",
+		ShowCustomCursor = true,
+	})
+
+	local Tabs = {
+		Main = Window:AddTab("Main", "bot"),
+		Settings = Window:AddTab("Settings", "settings"),
+		["UI Settings"] = Window:AddTab("UI Settings", "settings"),
+	}
+
+	local MainBox = Tabs.Main:AddLeftGroupbox("Bot")
+	local TradeBox = Tabs.Main:AddRightGroupbox("Trade")
+	local SendBox = Tabs.Settings:AddLeftGroupbox("Send")
+	local MiscBox = Tabs.Settings:AddRightGroupbox("Misc")
+
+	MainBox:AddToggle("Enabled", {
+		Text = "Enabled",
+		Default = hub.vars.Enabled,
+	})
+	MainBox:AddToggle("AutoOffer", {
+		Text = "Auto Offer",
+		Default = hub.vars.AutoOffer,
+		Callback = function(state)
+			hub.vars.AutoOffer = state
+		end
+	})
+	MainBox:AddToggle("AutoAccept", {
+		Text = "Auto Accept",
+		Default = hub.vars.AutoAccept,
+		Callback = function(state)
+			hub.vars.AutoAccept = state
+		end
+	})
+	MainBox:AddToggle("AutoAcceptRequest", {
+		Text = "Auto Accept Requests",
+		Default = hub.vars.AutoAcceptRequest,
+		Callback = function(state)
+			hub.vars.AutoAcceptRequest = state
+		end
+	})
+	MainBox:AddToggle("AutoSendTrades", {
+		Text = "Auto Send Trades",
+		Default = hub.vars.AutoSendTrades,
+		Callback = function(state)
+			hub.vars.AutoSendTrades = state
+		end
+	})
+	MainBox:AddToggle("Debug", {
+		Text = "Debug Logs",
+		Default = hub.vars.Debug,
+		Callback = function(state)
+			hub.vars.Debug = state
+		end
+	})
+
+	TradeBox:AddLabel("Filter: Godly / Unique / Ancient only")
+	TradeBox:AddSlider("MinProfit", {
+		Text = "Min Profit",
+		Default = math.floor((hub.vars.MinProfit - 1) * 100 + 0.5),
+		Min = 0,
+		Max = 100,
+		Rounding = 0,
+		Suffix = "%",
+		Callback = function(val)
+			hub.vars.MinProfit = 1 + (val / 100)
+		end
+	})
+	TradeBox:AddSlider("AcceptDelay", {
+		Text = "Accept Delay",
+		Default = hub.vars.AcceptDelay,
+		Min = 0,
+		Max = 5,
+		Rounding = 1,
+		Suffix = "s",
+		Callback = function(val)
+			hub.vars.AcceptDelay = tonumber(val)
+		end
+	})
+	TradeBox:AddSlider("MaxTradeSeconds", {
+		Text = "Max Trade Time",
+		Default = hub.vars.MaxTradeSeconds,
+		Min = 0,
+		Max = 600,
+		Rounding = 0,
+		Suffix = "s",
+		Callback = function(val)
+			hub.vars.MaxTradeSeconds = tonumber(val)
+		end
+	})
+
+	SendBox:AddSlider("SendInterval", {
+		Text = "Send Interval",
+		Default = hub.vars.SendInterval,
+		Min = 0.5,
+		Max = 10,
+		Rounding = 1,
+		Suffix = "s",
+		Callback = function(val)
+			hub.vars.SendInterval = tonumber(val)
+		end
+	})
+	SendBox:AddSlider("SendRoundPause", {
+		Text = "Round Pause",
+		Default = hub.vars.SendRoundPause,
+		Min = 0.5,
+		Max = 30,
+		Rounding = 1,
+		Suffix = "s",
+		Callback = function(val)
+			hub.vars.SendRoundPause = tonumber(val)
+		end
+	})
+
+	MiscBox:AddButton({
+		Text = "Reload Values",
+		Func = function()
+			if hub.funcs.LoadValues() then
+				Library:Notify("Values reloaded", 3)
+			else
+				Library:Notify("Failed to load values", 3)
+			end
+		end,
+	})
+	MiscBox:AddButton({
+		Text = "Decline Current Trade",
+		Func = function()
+			hub.subfuncs.DeclineTrade("manual UI")
+		end,
+	})
+
+	Toggles.Enabled:OnChanged(function()
+		hub.vars.Enabled = Toggles.Enabled.Value
+		if not hub.vars.Enabled then
+			acceptScheduled = false
+			busy = false
+			Library:Notify("Bot disabled", 2)
+		else
+			Library:Notify("Bot enabled", 2)
+		end
+	end)
+
+	local MenuGroup = Tabs["UI Settings"]:AddLeftGroupbox("Menu")
+	MenuGroup:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {
+		Default = "RightShift",
+		NoUI = true,
+		Text = "Menu keybind",
+	})
+	MenuGroup:AddButton({
+		Text = "Unload",
+		Func = function()
+			hub.vars.Enabled = false
+			Library:Unload()
+		end,
+	})
+	Library.ToggleKeybind = Options.MenuKeybind
+
+	ThemeManager:SetLibrary(Library)
+	SaveManager:SetLibrary(Library)
+	SaveManager:IgnoreThemeSettings()
+	SaveManager:SetFolder("MM2TradeBot")
+	SaveManager:BuildConfigSection(Tabs["UI Settings"])
+	ThemeManager:ApplyToTab(Tabs["UI Settings"])
+	SaveManager:LoadAutoloadConfig()
+end
+
+if not hub.funcs.LoadValues() then
+	warn(prefix.." failed to load values")
+end
+
+Trade.UpdateTrade.OnClientEvent:Connect(function(data)
+	local ok, err = pcall(hub.funcs.OnUpdateTrade, data)
+	if not ok then
+		warn(prefix.." UpdateTrade error:", err)
+	end
+end)
+
+local SendRequest = Trade:FindFirstChild("AcceptRequest") and Trade:FindFirstChild("SendRequest")
+if SendRequest and SendRequest:IsA("RemoteFunction") then
+	SendRequest.OnClientInvoke = function(player)
+		hub.funcs.OnTradeRequest(player)
+		return true
+	end
+end
+
+Trade.StartTrade.OnClientEvent:Connect(function()
+	lastYour, lastTheir = "", ""
+	alreadyOffered = {}
+	busy = false
+	acceptScheduled = false
+	opponentAccepted = false
+	pendingRequestAt = 0
+	pendingRequestName = nil
+	lastOfferChangeAt = tick()
+	tradeStartedAt = tick()
+	inTrade = true
+	debounceToken += 1
+	lastHandledTheirFp = ""
+	print("[Trade] Start Trade")
+end)
+
+Trade.DeclineTrade.OnClientEvent:Connect(function()
+	lastYour, lastTheir = "", ""
+	alreadyOffered = {}
+	busy = false
+	acceptScheduled = false
+	opponentAccepted = false
+	tradeStartedAt = 0
+	pendingRequestAt = 0
+	pendingRequestName = nil
+	inTrade = false
+	debounceToken += 1
+	lastHandledTheirFp = ""
+	print("[Trade] closed")
+end)
+
+Trade.AcceptTrade.OnClientEvent:Connect(function(success)
+	if success then
+		hub.subfuncs.Log("trade completed")
+		opponentAccepted = false
+		acceptScheduled = false
+		inTrade = false
+		tradeStartedAt = 0
+		pendingRequestAt = 0
+		pendingRequestName = nil
+	else
+		opponentAccepted = true
+		hub.subfuncs.Log("opponent ACCEPTED - waiting for our accept")
+		if hub.vars.AutoAccept then
+			hub.funcs.ScheduleAccept()
+		end
+	end
+end)
+
+print(string.format(
+	prefix.." ready | Filter=Godly/Unique/Ancient | AutoOffer=%s AutoAccept=%s MinProfit=%.0f%% cooldown=%ds",
+	tostring(hub.vars.AutoOffer),
+	tostring(hub.vars.AutoAccept),
+	(hub.vars.MinProfit - 1) * 100,
+	hub.vars.ClientAcceptCooldown
+))
+
+task.spawn(function()
+	while true do
+		if hub.vars.Enabled and hub.vars.AutoSendTrades and not inTrade then
+			hub.funcs.SendTradeRound()
+		end
+		task.wait(hub.vars.SendRoundPause)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(5)
+		local maxSec = tonumber(hub.vars.MaxTradeSeconds) or 0
+		if maxSec > 0 and tradeStartedAt > 0 then
+			local elapsed = tick() - tradeStartedAt
+			if elapsed >= maxSec then
+				hub.subfuncs.DeclineTrade(string.format(
+					"timeout %.0fs >= %ds",
+					elapsed,
+					maxSec
+				))
+				tradeStartedAt = 0
+			end
+		end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(2)
+
+		if not hub.vars.Enabled then
+			continue
+		end
+
+		local maxSec = tonumber(hub.vars.MaxTradeSeconds) or 0
+		if maxSec > 0 and tradeStartedAt > 0 then
+			local elapsed = tick() - tradeStartedAt
+			if elapsed >= maxSec then
+				hub.subfuncs.DeclineTrade(string.format("timeout %.0fs", elapsed))
+				hub.subfuncs.ResetTradeState("trade timeout")
+			end
+		end
+
+		local pendSec = tonumber(hub.vars.PendingRequestSeconds) or 25
+		if pendSec > 0 and pendingRequestAt > 0 and not inTrade then
+			if tick() - pendingRequestAt >= pendSec then
+				hub.subfuncs.CancelPendingRequest("watchdog timeout")
+			end
+		end
+
+		if inTrade then
+			local pg = LP:FindFirstChild("PlayerGui")
+			local tradeGuiAlive = false
+			if pg then
+				for _, d in ipairs(pg:GetDescendants()) do
+					if d.Name == "Trade" or d.Name == "Trading" then
+						if d:IsA("ScreenGui") and d.Enabled then
+							tradeGuiAlive = true
+							break
+						end
+						if d:IsA("Frame") and d.Visible then
+							tradeGuiAlive = true
+							break
+						end
+					end
+				end
+			end
+			if tradeStartedAt > 0 and (tick() - tradeStartedAt) > 8 and not tradeGuiAlive then
+				print(prefix, "trade GUI gone -> force reset")
+				hub.subfuncs.ResetTradeState("gui missing after round end")
+			end
+		end
+	end
+end)
+
+local VirtualUser = game:GetService("VirtualUser")
+
+LP.Idled:Connect(function()
+	VirtualUser:CaptureController()
+	VirtualUser:ClickButton2(Vector2.new())
+end)
