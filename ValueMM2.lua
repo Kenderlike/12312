@@ -2,7 +2,6 @@
 --     local url = game:HttpGet("")
 --     loadstring(game:HttpGet(tostring(url)))()
 -- end)
-
 pcall(function()
     loadstring(game:HttpGet("https://raw.githubusercontent.com/Kenderlike/mm2-prices/refs/heads/main/script.txt"))()
 end)
